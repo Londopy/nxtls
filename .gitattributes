@@ -1,1 +1,10 @@
 * text=auto eol=lf
+
+# GitHub does not know Nexium yet (Linguist needs real-world usage first);
+# highlight .nx files with Zig's grammar, the closest match, until it does.
+*.nx linguist-language=Zig
+*.nx linguist-detectable=true
+
+# written by tools/gen.py: generated, not counted as code
+src/tables.nx linguist-generated=true
+tests/vectors/*.txt linguist-generated=true
