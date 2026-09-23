@@ -1,0 +1,112 @@
+// hmac.nx: HMAC (RFC 2104) over SHA-256, SHA-384 and SHA-512.
+//
+// `import nxtls.hmac` then:
+//
+//     let tag = hmac.mac(sha2.Kind.Sha256, key, message)
+//     var m = hmac.Hmac.new(sha2.Kind.Sha256, key)
+//     m.update(part)
+//     let tag2 = m.finish()
+//     if !hmac.verify(sha2.Kind.Sha256, key, message, tag) { reject }
+//
+// Keys are secrets. The pads are the whole key block xored with a
+// constant, and `verify` compares with `ct.eq`; a key longer than a block
+// is hashed first, which depends on the key's length only. An Hmac is a
+// plain value, so a keyed one can be copied and reused (HKDF does).
+
+import sha2
+import ct
+
+/// A running HMAC.
+pub struct Hmac {
+    inner: sha2.Hasher
+    outer: sha2.Hasher
+}
+
+impl Hmac {
+    pub fn new(kind: sha2.Kind, key: []u8) -> Hmac {
+        let block = sha2.block_len(kind)
+        var k = if key.len > block { sha2.hash(kind, key) } else { String.from(key) }
+        while k.len < block {
+            k.push_byte(0)
+        }
+        var ipad = String.with_capacity(block)
+        var opad = String.with_capacity(block)
+        for i in 0..block {
+            ipad.push_byte(k[i] ^ 0x36)
+            opad.push_byte(k[i] ^ 0x5c)
+        }
+        var inner = sha2.Hasher.new(kind)
+        inner.update(ipad)
+        var outer = sha2.Hasher.new(kind)
+        outer.update(opad)
+        return Hmac{ .inner = inner, .outer = outer }
+    }
+
+    pub fn update(self: *mut Self, data: []u8) {
+        self.inner.update(data)
+    }
+
+    /// The tag, `sha2.digest_len(kind)` bytes; the Hmac is spent afterwards.
+    pub fn finish(self: *mut Self) -> String {
+        let inner_digest = self.inner.finish()
+        self.outer.update(inner_digest)
+        return self.outer.finish()
+    }
+}
+
+/// The tag of `message` under `key`, in one call.
+pub fn mac(kind: sha2.Kind, key: []u8, message: []u8) -> String {
+    var m = Hmac.new(kind, key)
+    m.update(message)
+    return m.finish()
+}
+
+/// Whether `tag` is the tag of `message` under `key`, compared in constant
+/// time.
+pub fn verify(kind: sha2.Kind, key: []u8, message: []u8, tag: []u8) -> bool {
+    return ct.eq(mac(kind, key, message), tag)
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.bytes
+import testvec
+
+test "known answers: RFC 4231 and keys either side of the block size" {
+    var count: usize = 0
+    for line in @embedFile("../tests/vectors/hmac.txt").lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let kind = testvec.kind_named(f[0])
+        let key = testvec.unhex(f[1])
+        let msg = testvec.unhex(f[2])
+        expect_eq(bytes.hex(mac(kind, key, msg)), f[3])
+        expect(verify(kind, key, msg, testvec.unhex(f[3])))
+        count += 1
+    }
+    expect_eq(count, 3 * (6 + 12))
+}
+
+test "verify rejects a changed or shortened tag" {
+    let kind = sha2.Kind.Sha256
+    let tag = mac(kind, "key", "message")
+    expect(verify(kind, "key", "message", tag))
+    var changed = tag.clone()
+    _ = changed.pop()
+    expect(!verify(kind, "key", "message", changed))
+    changed.push_byte(tag[31] ^ 1)
+    expect(!verify(kind, "key", "message", changed))
+    expect(!verify(kind, "key", "massage", tag))
+}
+
+test "a keyed Hmac copies" {
+    let base = Hmac.new(sha2.Kind.Sha512, "k")
+    var a = base
+    a.update("one")
+    var b = base
+    b.update("one")
+    expect_eq(a.finish(), b.finish())
+    expect_eq(mac(sha2.Kind.Sha512, "k", "one").len, 64)
+}

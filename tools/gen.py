@@ -319,8 +319,10 @@ def hkdf_label_vectors():
     assert early.hex() == "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
     derived = expand_label(hashlib.sha256, early, b"derived", hashlib.sha256(b"").digest(), 32)
     assert derived.hex() == "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
-    lines = ["# alg secret label context length output (label without the tls13 prefix)"]
-    lines.append("sha256 %s derived %s 32 %s" % (early.hex(), hashlib.sha256(b"").hexdigest(), derived.hex()))
+    lines = ["# alg secret label context length output; the label is hex (labels hold",
+             "# spaces) and without its tls13 prefix"]
+    lines.append("sha256 %s %s %s 32 %s" % (early.hex(), b"derived".hex(), hashlib.sha256(b"").hexdigest(),
+                                            derived.hex()))
     labels = [b"key", b"iv", b"finished", b"c hs traffic", b"s ap traffic", b"derived", b"traffic upd"]
     for name, fn in ALGS:
         for label in labels:
@@ -328,7 +330,7 @@ def hkdf_label_vectors():
             context = RNG.choice([b"", rand_bytes(fn().digest_size)])
             length = RNG.choice([12, 16, 32, fn().digest_size])
             out = expand_label(fn, secret, label, context, length)
-            lines.append("%s %s %s %s %d %s" % (name, secret.hex(), label.decode(), hx(context), length, out.hex()))
+            lines.append("%s %s %s %s %d %s" % (name, secret.hex(), label.hex(), hx(context), length, out.hex()))
     return "\n".join(lines) + "\n"
 
 

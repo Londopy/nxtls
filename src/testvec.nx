@@ -1,0 +1,39 @@
+// testvec.nx: helpers for the tests that read tests/vectors/*.txt.
+// Test support only; nothing outside the tests imports it.
+
+import std.bytes
+import sha2
+
+/// The bytes of a hex field; `-` is the empty string.
+pub fn unhex(s: []u8) -> String {
+    if s == "-" {
+        return String.new()
+    }
+    return bytes.unhex(s) catch {
+        panic("bad hex in a vector file")
+    }
+}
+
+/// The hash a vector file names.
+pub fn kind_named(name: []u8) -> sha2.Kind {
+    if name == "sha256" {
+        return sha2.Kind.Sha256
+    }
+    if name == "sha384" {
+        return sha2.Kind.Sha384
+    }
+    expect_eq(name, "sha512")
+    return sha2.Kind.Sha512
+}
+
+/// A decimal field.
+pub fn number(s: []u8) -> usize {
+    return s.parse_int(usize) catch {
+        panic("bad number in a vector file")
+    }
+}
+
+/// Whether a line of a vector file holds a vector (not blank, not a comment).
+pub fn is_vector(line: []u8) -> bool {
+    return line.len > 0 and line[0] != '#'
+}

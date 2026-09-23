@@ -1,0 +1,130 @@
+// hkdf.nx: HKDF (RFC 5869) and the TLS 1.3 key schedule's labels on top
+// of it (RFC 8446 section 7.1).
+//
+// `import nxtls.hkdf` then:
+//
+//     let prk = hkdf.extract(sha2.Kind.Sha256, salt, input_key)
+//     let okm = try hkdf.expand(sha2.Kind.Sha256, prk, info, 42)
+//     let iv = try hkdf.expand_label(kind, traffic_secret, "iv", "", 12)
+//     let next = try hkdf.derive_secret(kind, secret, "derived", empty_hash)
+//
+// Everything that goes in is secret key material; the work is HMAC over
+// it with public labels and lengths, so there is nothing data dependent
+// beyond what HMAC already guards.
+
+import sha2
+import hmac
+
+/// HKDF-Extract: a pseudorandom key from input keying material. An empty
+/// salt stands for HashLen zero bytes, which HMAC pads identically.
+pub fn extract(kind: sha2.Kind, salt: []u8, ikm: []u8) -> String {
+    return hmac.mac(kind, salt, ikm)
+}
+
+/// HKDF-Expand: `length` bytes of output keying material;
+/// `error.InvalidInput` beyond the 255 blocks HKDF allows.
+pub fn expand(kind: sha2.Kind, prk: []u8, info: []u8, length: usize) -> !String {
+    let size = sha2.digest_len(kind)
+    if length > 255 * size {
+        return error.InvalidInput
+    }
+    let keyed = hmac.Hmac.new(kind, prk)
+    var okm = String.with_capacity(length)
+    var t = String.new()
+    var counter: u8 = 1
+    while okm.len < length {
+        var m = keyed
+        m.update(t)
+        m.update(info)
+        var c = String.new()
+        c.push_byte(counter)
+        m.update(c)
+        t = m.finish()
+        let need = length - okm.len
+        if need < size {
+            okm.append(t[0..need])
+        } else {
+            okm.append(t)
+        }
+        counter +%= 1
+    }
+    return okm
+}
+
+/// HKDF-Expand-Label: `expand` with TLS 1.3's HkdfLabel as the info. The
+/// label is given without its "tls13 " prefix.
+pub fn expand_label(kind: sha2.Kind, secret: []u8, label: []u8, context: []u8, length: usize) -> !String {
+    if length > 0xffff or label.len > 249 or context.len > 255 {
+        return error.InvalidInput
+    }
+    var info = String.new()
+    info.push_byte(@truncate(u8, length >> 8))
+    info.push_byte(@truncate(u8, length))
+    info.push_byte(@truncate(u8, 6 + label.len))
+    info.append("tls13 ")
+    info.append(label)
+    info.push_byte(@truncate(u8, context.len))
+    info.append(context)
+    return expand(kind, secret, info, length)
+}
+
+/// Derive-Secret: a secret the hash's length, bound to a transcript hash.
+pub fn derive_secret(kind: sha2.Kind, secret: []u8, label: []u8, transcript_hash: []u8) -> !String {
+    return expand_label(kind, secret, label, transcript_hash, sha2.digest_len(kind))
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.bytes
+import testvec
+
+test "known answers: RFC 5869 cases and more with every hash" {
+    var count: usize = 0
+    for line in @embedFile("../tests/vectors/hkdf.txt").lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let kind = testvec.kind_named(f[0])
+        let prk = extract(kind, testvec.unhex(f[2]), testvec.unhex(f[1]))
+        expect_eq(bytes.hex(prk), f[5])
+        let okm = try expand(kind, prk, testvec.unhex(f[3]), testvec.number(f[4]))
+        expect_eq(bytes.hex(okm), f[6])
+        count += 1
+    }
+    expect_eq(count, 3 + 18)
+}
+
+test "known answers: TLS 1.3 labels, starting from RFC 8448's early secret" {
+    var count: usize = 0
+    for line in @embedFile("../tests/vectors/hkdf_label.txt").lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let kind = testvec.kind_named(f[0])
+        let out = try expand_label(kind, testvec.unhex(f[1]), testvec.unhex(f[2]), testvec.unhex(f[3]), testvec.number(f[4]))
+        expect_eq(bytes.hex(out), f[5])
+        count += 1
+    }
+    expect_eq(count, 1 + 21)
+}
+
+test "RFC 8448: the early secret and the derived secret after it" {
+    var zeros = String.new()
+    for _ in 0..32 {
+        zeros.push_byte(0)
+    }
+    let early = extract(sha2.Kind.Sha256, "", zeros)
+    expect_eq(bytes.hex(early), "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    let derived = try derive_secret(sha2.Kind.Sha256, early, "derived", sha2.sha256(""))
+    expect_eq(bytes.hex(derived), "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+}
+
+test "expand refuses more than 255 blocks" {
+    let prk = extract(sha2.Kind.Sha256, "salt", "ikm")
+    expect_eq((try expand(sha2.Kind.Sha256, prk, "", 255 * 32)).len, 255 * 32)
+    expect(testing.is_err(String, expand(sha2.Kind.Sha256, prk, "", 255 * 32 + 1)))
+}
+
+import std.testing

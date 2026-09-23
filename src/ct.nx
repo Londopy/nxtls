@@ -1,0 +1,40 @@
+// ct.nx: constant-time helpers for code that handles secrets.
+//
+// Each function runs the same instructions whatever the secret bytes are:
+// no early exit, no branch or index that depends on them. Lengths are
+// public.
+//
+// Not here, on purpose: wiping secrets from memory. A store to storage that
+// is freed right after is dead to the C compiler, which may drop it, so a
+// wipe written in plain code promises what it cannot keep. That needs a
+// runtime builtin (a volatile or explicit_bzero-style write).
+
+/// Whether `a` and `b` hold the same bytes, reading every byte.
+pub fn eq(a: []u8, b: []u8) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    var acc: u8 = 0
+    for i in 0..a.len {
+        acc |= a[i] ^ b[i]
+    }
+    return is_zero(acc)
+}
+
+/// Whether `x` is zero, without a branch: `x - 1` borrows into bit 8 only
+/// when `x` is 0.
+pub fn is_zero(x: u8) -> bool {
+    let wide = (x as u32) -% 1
+    return ((wide >> 8) & 1) == 1
+}
+
+test "eq reads every byte and agrees with ==" {
+    expect(eq("", ""))
+    expect(eq("abc", "abc"))
+    expect(!eq("abc", "abd"))
+    expect(!eq("abc", "bbc"))
+    expect(!eq("abc", "ab"))
+    for x in 0..256 {
+        expect_eq(is_zero(@truncate(u8, x)), x == 0)
+    }
+}

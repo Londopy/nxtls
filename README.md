@@ -14,6 +14,9 @@ TLS.
 | module | what | tested against |
 | --- | --- | --- |
 | `sha2` | SHA-256, SHA-384, SHA-512 | FIPS 180-4 messages, every padding boundary, a million a's |
+| `hmac` | HMAC over each of them, constant-time `verify` | RFC 4231, keys either side of the block size |
+| `hkdf` | HKDF extract and expand, TLS 1.3 `expand_label` and `derive_secret` | RFC 5869, RFC 8448's early and derived secrets |
+| `ct` | constant-time comparison | every byte value |
 
 ## Use
 
@@ -31,7 +34,8 @@ let digest = sha2.sha256("abc")        // 32 bytes
 ## Tests
 
 ```sh
-nx test src/sha2.nx
+nx test src/hkdf.nx                    # also runs the tests of what it imports
+nx test src/ed25519.nx
 python tools/gen.py --check            # the vectors and tables are current
 ```
 
