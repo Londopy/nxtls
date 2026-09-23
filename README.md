@@ -16,7 +16,13 @@ TLS.
 | `sha2` | SHA-256, SHA-384, SHA-512 | FIPS 180-4 messages, every padding boundary, a million a's |
 | `hmac` | HMAC over each of them, constant-time `verify` | RFC 4231, keys either side of the block size |
 | `hkdf` | HKDF extract and expand, TLS 1.3 `expand_label` and `derive_secret` | RFC 5869, RFC 8448's early and derived secrets |
+| `ed25519` | signature verification (verify only) | RFC 8032, random keys, tampering, S + L, non-canonical and small-order inputs |
 | `ct` | constant-time comparison | every byte value |
+
+`ed25519.verify` is stricter than RFC 8032 in the ways libsodium is: it
+also rejects non-canonical encodings and public keys or R values of small
+order. The vectors marked `strict` in `tests/vectors/ed25519.txt` are the
+cases where that differs from a permissive verifier such as OpenSSL's.
 
 ## Use
 
@@ -27,8 +33,10 @@ nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.1.0" }
 
 ```nexium
 import nxtls.sha2
+import nxtls.ed25519
 
 let digest = sha2.sha256("abc")        // 32 bytes
+if !ed25519.verify(public_key, message, signature) { ... }
 ```
 
 ## Tests
