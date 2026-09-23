@@ -1,15 +1,37 @@
+<div align="center">
+
+<img src="assets/nxtls.svg" width="96" height="96" alt="">
+
 # nxtls
 
-Cryptography and, later, a TLS 1.3 client, written entirely in Nexium: no
-C libraries, no `@cImport`, no `unsafe`. It exists so that Nexium programs
-(the first is [QNI](https://github.com/Londopy/qni), a Discord helper for an
-amateur radio club) can verify signatures and speak HTTPS with code a
-reviewer can read end to end.
+**Cryptography, and later a TLS 1.3 client, written entirely in Nexium.**<br>
+No C libraries, no `@cImport`, no `unsafe`: code a reviewer can read end to end.
 
-**Status: early.** What is here is tested against published vectors; the
-TLS client is not written yet. Do not use nxtls to protect anything that
-matters until the whole plan below has been reviewed by someone who knows
-TLS.
+[![CI](https://github.com/Londopy/nxtls/actions/workflows/ci.yml/badge.svg)](https://github.com/Londopy/nxtls/actions/workflows/ci.yml)
+[![Tag](https://img.shields.io/github/v/tag/Londopy/nxtls?sort=semver&color=0F766E)](https://github.com/Londopy/nxtls/tags)
+[![Written in Nexium](https://img.shields.io/badge/written%20in-Nexium-7C3AED)](https://github.com/Londopy/nexium)
+[![unsafe: 0](https://img.shields.io/badge/unsafe-0-14B8A6)](#tests)
+[![Status: early](https://img.shields.io/badge/status-early-orange)](#plan)
+[![License: MIT](https://img.shields.io/github/license/Londopy/nxtls?color=blue)](LICENSE)
+
+[Modules](#modules) · [Use](#use) · [Tests](#tests) · [Plan](#plan)
+
+</div>
+
+---
+
+nxtls exists so that Nexium programs can verify signatures and speak
+HTTPS without handing their security to a C library. The first user is
+[QNI](https://github.com/Londopy/qni), a Discord helper for an amateur
+radio club, which checks every request's Ed25519 signature with it.
+
+> [!WARNING]
+> **Early.** What is here is tested against published vectors; the TLS
+> client is not written yet. Do not use nxtls to protect anything that
+> matters until the whole plan below has been reviewed by someone who
+> knows TLS.
+
+## Modules
 
 | module | what | tested against |
 | --- | --- | --- |
@@ -39,6 +61,10 @@ let digest = sha2.sha256("abc")        // 32 bytes
 if !ed25519.verify(public_key, message, signature) { ... }
 ```
 
+`nx fetch` gets it into `nexium_modules/` and pins the commit in
+`nexium.lock`. It needs a 64-bit target: the field arithmetic uses
+128-bit integers.
+
 ## Tests
 
 ```sh
@@ -52,13 +78,23 @@ python tools/gen.py --check            # the vectors and tables are current
 `tests/vectors/` from Python's `hashlib`, `hmac` and the `cryptography`
 package, asserting the published values from each standard along the way.
 
+CI runs the tests on Linux (built against glibc, whose debug build traps
+on undefined behaviour), Windows and macOS. It also checks that no module
+has an `unsafe` block, a mutable global or a foreign call, and that the
+tables and vectors are current.
+
 ## Plan
 
-The order lets each piece be tested alone: SHA-2, HMAC and HKDF; Ed25519
-verification; ChaCha20-Poly1305 and X25519; DER, PEM, X.509, RSA and ECDSA
-verification; the record layer and the TLS 1.3 handshake (replayed against
-RFC 8448 byte for byte, then live hosts, with badssl.com's broken hosts as
-negative tests); secure randomness.
+The order lets each piece be tested alone:
+
+1. ~~SHA-2, HMAC and HKDF~~
+2. ~~Ed25519 verification~~
+3. ChaCha20-Poly1305 and X25519
+4. DER, PEM, X.509, RSA and ECDSA verification
+5. The record layer and the TLS 1.3 handshake: replayed against RFC 8448
+   byte for byte, then live hosts, with badssl.com's broken hosts as
+   negative tests
+6. Secure randomness
 
 Code that touches secrets (X25519, HMAC and HKDF over traffic secrets,
 ChaCha20-Poly1305) is written constant time: fixed-length loops, no early
@@ -68,4 +104,4 @@ certificate parsing) is ordinary code.
 
 ## License
 
-MIT
+[MIT](LICENSE)
