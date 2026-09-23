@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Generate nxtls's constant tables and test vectors.
+
+Test tooling only, never shipped with nxtls. Every constant in
+src/tables.nx is derived here from its definition (roots of primes for
+SHA-2, the curve equation for Ed25519), and every vector under
+tests/vectors/ comes from Python's hashlib and hmac and from the
+`cryptography` package, which serve as the reference implementations
+the Nexium code has to agree with. Published values from the standards
+(FIPS 180-4, RFC 4231, RFC 5869, RFC 8032, RFC 8448) are asserted along
+the way, so a mistake here cannot quietly become a "correct" answer.
+
+    python tools/gen.py           rewrite src/tables.nx and tests/vectors/
+    python tools/gen.py --check   exit 1 when the files on disk differ
+"""
+
+import hashlib
+import hmac as pyhmac
+import os
+import random
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.exceptions import InvalidSignature
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RNG = random.Random(20260922)
+
+
+def rand_bytes(n):
+    return bytes(RNG.getrandbits(8) for _ in range(n))
+
+
+def hx(b):
+    return b.hex() if b else "-"
+
+
+# ------------------------------------------------------------------ SHA-2
+
+
+def primes(n):
+    out = []
+    c = 2
+    while len(out) < n:
+        if all(c % q for q in out if q * q <= c):
+            out.append(c)
+        c += 1
+    return out
+
+
+def icbrt(n):
+    x = 1 << ((n.bit_length() + 2) // 3)
+    while True:
+        y = (2 * x + n // (x * x)) // 3
+        if y >= x:
+            break
+        x = y
+    while x ** 3 > n:
+        x -= 1
+    while (x + 1) ** 3 <= n:
+        x += 1
+    return x
+
+
+def isqrt(n):
+    import math
+
+    return math.isqrt(n)
+
+
+P80 = primes(80)
+M32 = (1 << 32) - 1
+M64 = (1 << 64) - 1
+K256 = [icbrt(q << 96) & M32 for q in P80[:64]]
+K512 = [icbrt(q << 192) & M64 for q in P80]
+IV256 = [isqrt(q << 64) & M32 for q in P80[:8]]
+IV384 = [isqrt(q << 128) & M64 for q in P80[8:16]]
+IV512 = [isqrt(q << 128) & M64 for q in P80[:8]]
+
+# FIPS 180-4 sections 4.2.2, 4.2.3, 5.3.3 to 5.3.5
+assert K256[0] == 0x428A2F98 and K256[63] == 0xC67178F2
+assert K512[0] == 0x428A2F98D728AE22 and K512[79] == 0x6C44198C4A475817
+assert IV256 == [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+                 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19]
+assert IV384[0] == 0xCBBB9D5DC1059ED8 and IV384[7] == 0x47B5481DBEFA4FA4
+assert IV512[0] == 0x6A09E667F3BCC908 and IV512[7] == 0x5BE0CD19137E2179
+
+
+# ------------------------------------------------------------------ Ed25519
+
+P = 2 ** 255 - 19
+L = 2 ** 252 + 27742317777372353535851937790883648493
+D = -121665 * pow(121666, P - 2, P) % P
+SQRT_M1 = pow(2, (P - 1) // 4, P)
+assert D == 37095705934669439343138083508754565189542113879843219016388785533085940283555
+assert SQRT_M1 * SQRT_M1 % P == P - 1
+
+
+def recover_x(y, sign):
+    if y >= P:
+        return None
+    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (P + 3) // 8, P)
+    if (x * x - x2) % P != 0:
+        x = x * SQRT_M1 % P
+    if (x * x - x2) % P != 0:
+        return None
+    if (x & 1) != sign:
+        x = P - x
+    return x
+
+
+BY = 4 * pow(5, P - 2, P) % P
+BX = recover_x(BY, 0)
+assert BX == 15112221349535400772501151409588531511454012693041857206046113283949847762202
+
+
+def enc_point(x, y):
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+assert enc_point(BX, BY) == bytes.fromhex("58" + "66" * 31)
+
+
+def pt_add(p1, p2):
+    (x1, y1), (x2, y2) = p1, p2
+    t = D * x1 * x2 * y1 * y2 % P
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + t, P - 2, P) % P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, P - 2, P) % P
+    return (x3, y3)
+
+
+def pt_mul(s, pt):
+    q = (0, 1)
+    while s > 0:
+        if s & 1:
+            q = pt_add(q, pt)
+        pt = pt_add(pt, pt)
+        s >>= 1
+    return q
+
+
+def limbs(v):
+    return [(v >> (51 * i)) & ((1 << 51) - 1) for i in range(5)]
+
+
+# ------------------------------------------------------------------ tables.nx
+
+
+def nx_array(name, typ, values, width, per_line):
+    digits = width // 4
+    rows = []
+    for i in range(0, len(values), per_line):
+        chunk = values[i : i + per_line]
+        rows.append("    " + ", ".join("0x%0*x" % (digits, v) for v in chunk) + ",")
+    return "pub const %s: [%d]%s = [\n%s\n]\n" % (name, len(values), typ, "\n".join(rows))
+
+
+def nx_bytes(name, b):
+    return nx_array(name, "u8", list(b), 8, 16)
+
+
+def nx_fe(name, v):
+    return "pub const %s: [5]u64 = [%s]\n" % (name, ", ".join("0x%x" % l for l in limbs(v)))
+
+
+def tables_nx():
+    parts = [
+        "// tables.nx: constants for sha2.nx and ed25519.nx.\n"
+        "//\n"
+        "// GENERATED by tools/gen.py; do not edit. Each value is derived there\n"
+        "// from its definition: SHA-2's round constants are the fractional\n"
+        "// parts of the cube roots of the first 80 primes and its initial\n"
+        "// values the square roots of the first 16 (FIPS 180-4); the Ed25519\n"
+        "// constants come from the curve equation (RFC 8032), with field\n"
+        "// elements as five 51-bit limbs, least significant first.\n",
+        nx_array("K256", "u32", K256, 32, 4),
+        nx_array("K512", "u64", K512, 64, 2),
+        nx_array("IV256", "u32", IV256, 32, 4),
+        nx_array("IV384", "u64", IV384, 64, 2),
+        nx_array("IV512", "u64", IV512, 64, 2),
+        "/// d = -121665/121666 mod p\n" + nx_fe("ED_D", D),
+        "/// 2d, used by point addition\n" + nx_fe("ED_D2", 2 * D % P),
+        "/// a square root of -1 mod p, 2^((p-1)/4)\n" + nx_fe("ED_SQRT_M1", SQRT_M1),
+        "/// the base point B: y = 4/5, x even; t = xy\n"
+        + nx_fe("ED_BX", BX)
+        + nx_fe("ED_BY", BY)
+        + nx_fe("ED_BT", BX * BY % P),
+        "/// the group order L = 2^252 + 27742317777372353535851937790883648493, little-endian\n"
+        + nx_bytes("ED_L", L.to_bytes(32, "little")),
+        "/// p - 2, the exponent of an inversion, little-endian\n"
+        + nx_bytes("ED_P_MINUS_2", (P - 2).to_bytes(32, "little")),
+        "/// (p + 3) / 8, the exponent of a square root candidate, little-endian\n"
+        + nx_bytes("ED_P_PLUS_3_DIV_8", ((P + 3) // 8).to_bytes(32, "little")),
+    ]
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ vectors
+
+NIST_MESSAGES = [
+    b"",
+    b"abc",
+    b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+    b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+    b"ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+]
+ALGS = [("sha256", hashlib.sha256), ("sha384", hashlib.sha384), ("sha512", hashlib.sha512)]
+
+
+def pattern(n):
+    # the same generator is in the Nexium tests: byte i of message n
+    return bytes(((i * 31) + n) & 0xFF for i in range(n))
+
+
+def sha2_vectors():
+    assert hashlib.sha256(b"abc").hexdigest() == (
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    lines = ["# alg message digest; message is hex, - for empty, pattern:N, or million-a"]
+    for name, fn in ALGS:
+        for m in NIST_MESSAGES:
+            lines.append("%s %s %s" % (name, hx(m), fn(m).hexdigest()))
+        for n in list(range(0, 141)) + [191, 192, 239, 240, 255, 256, 257, 1000, 4099]:
+            lines.append("%s pattern:%d %s" % (name, n, fn(pattern(n)).hexdigest()))
+        lines.append("%s million-a %s" % (name, fn(b"a" * 1000000).hexdigest()))
+    return "\n".join(lines) + "\n"
+
+
+RFC4231 = [
+    (b"\x0b" * 20, b"Hi There"),
+    (b"Jefe", b"what do ya want for nothing?"),
+    (b"\xaa" * 20, b"\xdd" * 50),
+    (bytes(range(1, 26)), b"\xcd" * 50),
+    (b"\xaa" * 131, b"Test Using Larger Than Block-Size Key - Hash Key First"),
+    (b"\xaa" * 131, b"This is a test using a larger than block-size key and a larger "
+                    b"than block-size data. The key needs to be hashed before being "
+                    b"used by the HMAC algorithm."),
+]
+
+
+def hmac_vectors():
+    assert pyhmac.new(RFC4231[0][0], RFC4231[0][1], hashlib.sha256).hexdigest() == (
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    lines = ["# alg key message mac (hex, - for empty)"]
+    for name, fn in ALGS:
+        for key, msg in RFC4231:
+            lines.append("%s %s %s %s" % (name, hx(key), hx(msg), pyhmac.new(key, msg, fn).hexdigest()))
+        for kl in [0, 1, 32, 47, 48, 63, 64, 65, 127, 128, 129, 200]:
+            key = rand_bytes(kl)
+            msg = rand_bytes(RNG.randrange(0, 300))
+            lines.append("%s %s %s %s" % (name, hx(key), hx(msg), pyhmac.new(key, msg, fn).hexdigest()))
+    return "\n".join(lines) + "\n"
+
+
+def py_hkdf(fn, salt, ikm, info, length):
+    size = fn().digest_size
+    prk = pyhmac.new(salt if salt else b"\x00" * size, ikm, fn).digest()
+    okm, t, i = b"", b"", 1
+    while len(okm) < length:
+        t = pyhmac.new(prk, t + info + bytes([i]), fn).digest()
+        okm += t
+        i += 1
+    return prk, okm[:length]
+
+
+def expand_label(fn, secret, label, context, length):
+    full = b"tls13 " + label
+    info = length.to_bytes(2, "big") + bytes([len(full)]) + full + bytes([len(context)]) + context
+    size = fn().digest_size
+    okm, t, i = b"", b"", 1
+    while len(okm) < length:
+        t = pyhmac.new(secret, t + info + bytes([i]), fn).digest()
+        okm += t
+        i += 1
+    assert size > 0
+    return okm[:length]
+
+
+def hkdf_vectors():
+    rfc5869 = [
+        (bytes.fromhex("0b" * 22), bytes.fromhex("000102030405060708090a0b0c"),
+         bytes.fromhex("f0f1f2f3f4f5f6f7f8f9"), 42),
+        (bytes(range(0x00, 0x50)), bytes(range(0x60, 0xB0)), bytes(range(0xB0, 0x100)), 82),
+        (bytes.fromhex("0b" * 22), b"", b"", 42),
+    ]
+    ikm, salt, info, length = rfc5869[0]
+    prk, okm = py_hkdf(hashlib.sha256, salt, ikm, info, length)
+    assert prk.hex() == "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+    assert okm.hex() == ("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                         "34007208d5b887185865")
+    lines = ["# alg ikm salt info length prk okm"]
+    algs = {"sha256": (hashlib.sha256, hashes.SHA256()), "sha384": (hashlib.sha384, hashes.SHA384()),
+            "sha512": (hashlib.sha512, hashes.SHA512())}
+    cases = [("sha256",) + c for c in rfc5869]
+    for name in algs:
+        for _ in range(6):
+            cases.append((name, rand_bytes(RNG.randrange(1, 90)), rand_bytes(RNG.choice([0, 13, 64, 128])),
+                          rand_bytes(RNG.randrange(0, 40)), RNG.randrange(1, 300)))
+    for name, ikm, salt, info, length in cases:
+        fn, alg = algs[name]
+        prk, okm = py_hkdf(fn, salt, ikm, info, length)
+        ref = HKDF(algorithm=alg, length=length, salt=salt or None, info=info).derive(ikm)
+        assert ref == okm, "HKDF disagrees with cryptography"
+        lines.append("%s %s %s %s %d %s %s" % (name, hx(ikm), hx(salt), hx(info), length, prk.hex(), okm.hex()))
+    return "\n".join(lines) + "\n"
+
+
+def hkdf_label_vectors():
+    # RFC 8448 section 3, "Simple 1-RTT Handshake": the early secret and the
+    # "derived" secret that follows it
+    early, _ = py_hkdf(hashlib.sha256, b"", b"\x00" * 32, b"", 32)
+    assert early.hex() == "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
+    derived = expand_label(hashlib.sha256, early, b"derived", hashlib.sha256(b"").digest(), 32)
+    assert derived.hex() == "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
+    lines = ["# alg secret label context length output (label without the tls13 prefix)"]
+    lines.append("sha256 %s derived %s 32 %s" % (early.hex(), hashlib.sha256(b"").hexdigest(), derived.hex()))
+    labels = [b"key", b"iv", b"finished", b"c hs traffic", b"s ap traffic", b"derived", b"traffic upd"]
+    for name, fn in ALGS:
+        for label in labels:
+            secret = rand_bytes(fn().digest_size)
+            context = RNG.choice([b"", rand_bytes(fn().digest_size)])
+            length = RNG.choice([12, 16, 32, fn().digest_size])
+            out = expand_label(fn, secret, label, context, length)
+            lines.append("%s %s %s %s %d %s" % (name, secret.hex(), label.decode(), hx(context), length, out.hex()))
+    return "\n".join(lines) + "\n"
+
+
+def raw_pub(key):
+    return key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def ref_verify(pk, msg, sig):
+    try:
+        Ed25519PublicKey.from_public_bytes(pk).verify(sig, msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def ed25519_vectors():
+    lines = ["# expect public-key message signature what",
+             "# nxtls is stricter than RFC 8032 where marked strict: like libsodium it",
+             "# rejects small-order public keys and R values and every non-canonical",
+             "# encoding, which some verifiers (OpenSSL among them) accept"]
+    checked = []
+
+    def add(expect, pk, msg, sig, what, strict=False):
+        what = what.replace(" ", "_") + ("_strict" if strict else "")
+        lines.append("%s %s %s %s %s" % (expect, hx(pk), hx(msg), hx(sig), what))
+        if not strict:
+            checked.append((expect, pk, msg, sig, what))
+
+    # RFC 8032 section 7.1, TEST 1, 2 and 3: keys from their secret seeds
+    rfc = [
+        ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60", b"",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e0652249015"
+         "55fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb", bytes.fromhex("72"),
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+         "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7", bytes.fromhex("af82"),
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+         "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+    ]
+    for i, (seed, msg, sig) in enumerate(rfc):
+        key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed))
+        assert key.sign(msg).hex() == sig, "RFC 8032 test %d" % (i + 1)
+        add("valid", raw_pub(key), msg, bytes.fromhex(sig), "rfc8032 test %d" % (i + 1))
+
+    for i in range(40):
+        key = Ed25519PrivateKey.from_private_bytes(rand_bytes(32))
+        pk = raw_pub(key)
+        msg = rand_bytes(RNG.choice([0, 1, 31, 32, 64, 100, 511, 1500]))
+        sig = key.sign(msg)
+        add("valid", pk, msg, sig, "random %d" % i)
+        if i % 4 == 0:
+            bad = bytearray(msg or b"\x00")
+            bad[RNG.randrange(len(bad))] ^= 1 << RNG.randrange(8)
+            add("invalid", pk, bytes(bad), sig, "message bit flipped %d" % i)
+        if i % 4 == 1:
+            bad = bytearray(sig)
+            bad[RNG.randrange(32)] ^= 1 << RNG.randrange(8)
+            add("invalid", pk, msg, bytes(bad), "R bit flipped %d" % i)
+        if i % 4 == 2:
+            bad = bytearray(sig)
+            bad[32 + RNG.randrange(31)] ^= 1 << RNG.randrange(8)
+            add("invalid", pk, msg, bytes(bad), "S bit flipped %d" % i)
+        if i % 4 == 3:
+            other = raw_pub(Ed25519PrivateKey.from_private_bytes(rand_bytes(32)))
+            add("invalid", other, msg, sig, "someone else's key %d" % i)
+        if i < 6:
+            # S + L names the same point; RFC 8032 requires rejecting S >= L
+            s = int.from_bytes(sig[32:], "little") + L
+            assert s < 2 ** 256
+            add("invalid", pk, msg, sig[:32] + s.to_bytes(32, "little"), "S plus L %d" % i)
+
+    # the identity as a public key signs anything with R = B, S = 1
+    msg = b"small order"
+    r_b = enc_point(BX, BY)
+    one = (1).to_bytes(32, "little")
+    add("invalid", (1).to_bytes(32, "little"), msg, r_b + one, "identity public key", strict=True)
+    add("invalid", (P + 1).to_bytes(32, "little"), msg, r_b + one, "noncanonical identity key", strict=True)
+    add("invalid", ((1 << 255) | 1).to_bytes(32, "little"), msg, r_b + one, "x zero with sign bit", strict=True)
+    # (sqrt(-1), 0) is a point of order 4
+    four = recover_x(0, 0)
+    assert four is not None and pt_mul(4, (four, 0)) == (0, 1)
+    add("invalid", enc_point(four, 0), msg, r_b + one, "order four public key", strict=True)
+    # a y with no x on the curve
+    y = 2
+    while recover_x(y, 0) is not None:
+        y += 1
+    key = Ed25519PrivateKey.from_private_bytes(rand_bytes(32))
+    sig = key.sign(msg)
+    add("invalid", y.to_bytes(32, "little"), msg, sig, "public key off the curve")
+    # y = p is out of range even though p mod p = 0 names a point
+    add("invalid", raw_pub(key), msg, sig[:32] + L.to_bytes(32, "little"), "S equal to L")
+    add("invalid", raw_pub(key), msg, (1).to_bytes(32, "little") + sig[32:], "identity R")
+    add("invalid", raw_pub(key)[:31], msg, sig, "short public key")
+    add("invalid", raw_pub(key), msg, sig[:63], "short signature")
+
+    # the reference agrees with every expectation that is not marked strict
+    for expect, pk, msg, sig, what in checked:
+        got = ref_verify(pk, msg, sig)
+        assert got == (expect == "valid"), "reference disagrees on " + what
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ main
+
+OUTPUTS = {
+    "src/tables.nx": tables_nx,
+    "tests/vectors/sha2.txt": sha2_vectors,
+    "tests/vectors/hmac.txt": hmac_vectors,
+    "tests/vectors/hkdf.txt": hkdf_vectors,
+    "tests/vectors/hkdf_label.txt": hkdf_label_vectors,
+    "tests/vectors/ed25519.txt": ed25519_vectors,
+}
+
+
+def main():
+    check = "--check" in sys.argv
+    stale = []
+    for rel, make in OUTPUTS.items():
+        text = make()
+        path = os.path.join(ROOT, rel)
+        old = open(path, encoding="utf-8").read() if os.path.exists(path) else None
+        if old == text:
+            continue
+        if check:
+            stale.append(rel)
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        print("wrote", rel)
+    if stale:
+        print("out of date:", ", ".join(stale))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
