@@ -42,7 +42,10 @@ radio club, which checks every request's Ed25519 signature with it.
 | `ed25519` | signature verification (verify only) | RFC 8032, random keys, tampering, S + L, non-canonical and small-order inputs |
 | `x25519` | X25519 key agreement, constant time; refuses an all-zero shared secret | RFC 7748 (the iterated test to 1000, Alice and Bob), random keys, points on the twist, u with bit 255 set, small-order points |
 | `chacha20poly1305` | ChaCha20, Poly1305 and their AEAD, constant time | RFC 8439 (every vector of its appendix, among them the Poly1305 carry and reduction cases), random lengths and counters, tampering |
+| `ecdsa` | ECDSA verification on P-256 and P-384, signatures in DER (verify only) | curve checks (G on the curve, n G at infinity), deterministic signatures from Python's cryptography, malleable s, tampering, keys off the curve, r and s out of range, strict DER |
 | `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
+| `bn` | big integers with Montgomery multiplication, for verification (public values only) | known products, powers and inverses; through `ecdsa` |
+| `der` | a strict DER reader: shortest lengths, positive minimal integers | malformed and non-minimal encodings |
 | `ct` | constant-time comparison | every byte value |
 
 `ed25519.verify` is stricter than RFC 8032 in the ways libsodium is: it
@@ -77,6 +80,7 @@ nx test src/ed25519.nx
 nx test src/sha1.nx
 nx test src/x25519.nx
 nx test src/chacha20poly1305.nx
+nx test src/ecdsa.nx
 python tools/gen.py --check            # the vectors and tables are current
 ```
 

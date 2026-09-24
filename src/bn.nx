@@ -1,0 +1,390 @@
+// bn.nx: unsigned big integers for signature verification: RSA's modular
+// exponentiation, and the field and scalar arithmetic of the NIST curves
+// (ecdsa.nx).
+//
+// A number is a little-endian list of 32-bit limbs. Everything here works
+// on public values only (moduli, public keys, signatures, hashes of public
+// data), so, like ed25519.nx, it is ordinary variable-time code: there is
+// no secret for timing to leak. Multiplication modulo an odd m is
+// Montgomery's (CIOS), with values kept in Montgomery form (aR mod m)
+// between operations.
+
+/// A number from big-endian bytes (leading zeros allowed).
+pub fn from_be(b: []u8) -> List(u32) {
+    var out = List(u32).new()
+    var i = b.len
+    while i > 0 {
+        var w: u32 = 0
+        var shift: u32 = 0
+        var k = 0
+        while k < 4 and i > 0 {
+            i -= 1
+            w |= (b[i] as u32) << shift
+            shift += 8
+            k += 1
+        }
+        out.append(w)
+    }
+    return trimmed(out)
+}
+
+/// `a` as exactly `len` big-endian bytes (the value must fit).
+pub fn to_be(a: []u32, len: usize) -> String {
+    var out = String.with_capacity(len)
+    var i = len
+    while i > 0 {
+        i -= 1
+        let limb = i / 4
+        let w = if limb < a.len { a[limb] } else { 0 }
+        out.push_byte(@truncate(u8, w >> ((8 * (i % 4)) as u32)))
+    }
+    return out
+}
+
+/// A small number.
+pub fn small(v: u32) -> List(u32) {
+    var out = List(u32).new()
+    if v != 0 {
+        out.append(v)
+    }
+    return out
+}
+
+fn trimmed(own a: List(u32)) -> List(u32) {
+    var t = a
+    while t.len > 0 and t[t.len - 1] == 0 {
+        _ = t.remove(t.len - 1)
+    }
+    return t
+}
+
+fn limb(a: []u32, i: usize) -> u32 {
+    return if i < a.len { a[i] } else { 0 }
+}
+
+pub fn is_zero(a: []u32) -> bool {
+    for w in a {
+        if w != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+/// -1, 0 or 1 as a is below, equal to or above b.
+pub fn cmp(a: []u32, b: []u32) -> i64 {
+    var i = @max(a.len, b.len)
+    while i > 0 {
+        i -= 1
+        let x = limb(a, i)
+        let y = limb(b, i)
+        if x != y {
+            return if x < y { -1 } else { 1 }
+        }
+    }
+    return 0
+}
+
+/// The number of bits in a (0 for zero).
+pub fn bits(a: []u32) -> usize {
+    var i = a.len
+    while i > 0 {
+        i -= 1
+        if a[i] != 0 {
+            var w = a[i]
+            var n: usize = 0
+            while w != 0 {
+                w >>= 1
+                n += 1
+            }
+            return i * 32 + n
+        }
+    }
+    return 0
+}
+
+/// Bit `i` of a (0 is the least significant).
+pub fn bit(a: []u32, i: usize) -> bool {
+    return ((limb(a, i / 32) >> ((i % 32) as u32)) & 1) == 1
+}
+
+pub fn add(a: []u32, b: []u32) -> List(u32) {
+    var out = List(u32).new()
+    var carry: u64 = 0
+    for i in 0..@max(a.len, b.len) {
+        let s = (limb(a, i) as u64) + (limb(b, i) as u64) + carry
+        out.append(@truncate(u32, s))
+        carry = s >> 32
+    }
+    if carry != 0 {
+        out.append(@truncate(u32, carry))
+    }
+    return trimmed(out)
+}
+
+/// a - b, for a >= b.
+pub fn sub(a: []u32, b: []u32) -> List(u32) {
+    var out = List(u32).new()
+    var borrow: u64 = 0
+    for i in 0..a.len {
+        let x = limb(a, i) as u64
+        let y = (limb(b, i) as u64) + borrow
+        if x >= y {
+            out.append(@truncate(u32, x - y))
+            borrow = 0
+        } else {
+            out.append(@truncate(u32, (x + 0x100000000) - y))
+            borrow = 1
+        }
+    }
+    return trimmed(out)
+}
+
+/// a with the top bits past `n` removed: a mod 2^n.
+pub fn low_bits(a: []u32, n: usize) -> List(u32) {
+    var out = List(u32).new()
+    for i in 0..a.len {
+        if i * 32 >= n {
+            break
+        }
+        if (i + 1) * 32 <= n {
+            out.append(a[i])
+        } else {
+            out.append(a[i] & ((1 << ((n - i * 32) as u32)) - 1))
+        }
+    }
+    return trimmed(out)
+}
+
+/// a shifted right by `n` bits.
+pub fn shr(a: []u32, n: usize) -> List(u32) {
+    var out = List(u32).new()
+    let words = n / 32
+    let s = (n % 32) as u32
+    var i = words
+    while i < a.len {
+        var w = a[i] >> s
+        if s != 0 {
+            w |= limb(a, i + 1) << (32 - s)
+        }
+        out.append(w)
+        i += 1
+    }
+    return trimmed(out)
+}
+
+// ------------------------------------------------------------------ Montgomery
+
+/// Arithmetic modulo an odd m: R = 2^(32k) for m's k limbs.
+pub struct Mont {
+    m: List(u32)
+    k: usize
+    /// -m^-1 mod 2^32
+    m0inv: u32
+    /// R^2 mod m, to bring numbers into Montgomery form
+    r2: List(u32)
+    /// R mod m: 1 in Montgomery form
+    one: List(u32)
+}
+
+fn padded(a: []u32, k: usize) -> List(u32) {
+    var out = List(u32).new()
+    for i in 0..k {
+        out.append(limb(a, i))
+    }
+    return out
+}
+
+/// The context for an odd modulus m > 1; null for an even or tiny one.
+pub fn mont(m: []u32) -> ?Mont {
+    let mm = trimmed(padded(m, m.len))
+    if mm.len == 0 or (mm[0] & 1) == 0 or (mm.len == 1 and mm[0] == 1) {
+        return null
+    }
+    let k = mm.len
+    // Newton's iteration for m0^-1 mod 2^32: each step doubles the bits
+    var inv: u32 = 1
+    for _ in 0..5 {
+        inv = inv *% (2 -% (mm[0] *% inv))
+    }
+    // R^2 mod m and R mod m by doubling, one bit at a time
+    var x = small(1)
+    for _ in 0..(64 * k) {
+        x = add(x, x)
+        if cmp(x, mm) >= 0 {
+            x = sub(x, mm)
+        }
+    }
+    var one = small(1)
+    for _ in 0..(32 * k) {
+        one = add(one, one)
+        if cmp(one, mm) >= 0 {
+            one = sub(one, mm)
+        }
+    }
+    return Mont{ .m = mm.clone(), .k = k, .m0inv = (0 as u32) -% inv, .r2 = padded(x, k), .one = padded(one, k) }
+}
+
+impl Mont {
+    /// a * b / R mod m, for a and b below m (Montgomery form in, out).
+    pub fn mul(self: *Self, a: []u32, b: []u32) -> List(u32) {
+        let k = self.k
+        var t = List(u32).new()
+        for _ in 0..(k + 2) {
+            t.append(0)
+        }
+        for i in 0..k {
+            let bi = limb(b, i) as u64
+            var c: u64 = 0
+            for j in 0..k {
+                let s = (t[j] as u64) + (limb(a, j) as u64) * bi + c
+                t[j] = @truncate(u32, s)
+                c = s >> 32
+            }
+            var s = (t[k] as u64) + c
+            t[k] = @truncate(u32, s)
+            t[k + 1] = @truncate(u32, s >> 32)
+            let q = (t[0] *% self.m0inv) as u64
+            s = (t[0] as u64) + q * (self.m[0] as u64)
+            c = s >> 32
+            for j in 1..k {
+                s = (t[j] as u64) + q * (self.m[j] as u64) + c
+                t[j - 1] = @truncate(u32, s)
+                c = s >> 32
+            }
+            s = (t[k] as u64) + c
+            t[k - 1] = @truncate(u32, s)
+            t[k] = t[k + 1] + @truncate(u32, s >> 32)
+        }
+        var r = List(u32).new()
+        for j in 0..k {
+            r.append(t[j])
+        }
+        if t[k] != 0 or cmp(r, self.m) >= 0 {
+            // t < 2m: one subtraction, over k + 1 limbs
+            var wide = List(u32).new()
+            for j in 0..(k + 1) {
+                wide.append(t[j])
+            }
+            return padded(sub(wide, self.m), k)
+        }
+        return r
+    }
+
+    /// a (below m) into Montgomery form.
+    pub fn to(self: *Self, a: []u32) -> List(u32) {
+        return self.mul(padded(a, self.k), self.r2)
+    }
+
+    /// a out of Montgomery form.
+    pub fn from(self: *Self, a: []u32) -> List(u32) {
+        return trimmed(self.mul(a, small(1)))
+    }
+
+    /// a mod m for any a (by long division one bit at a time; used for
+    /// hashes and coordinates that may exceed m once).
+    pub fn reduce(self: *Self, a: []u32) -> List(u32) {
+        var r = List(u32).new()
+        var i = bits(a)
+        while i > 0 {
+            i -= 1
+            r = add(r, r)
+            if bit(a, i) {
+                r = add(r, small(1))
+            }
+            if cmp(r, self.m) >= 0 {
+                r = sub(r, self.m)
+            }
+        }
+        return r
+    }
+
+    /// a + b mod m (both below m; any form).
+    pub fn add(self: *Self, a: []u32, b: []u32) -> List(u32) {
+        let s = add(a, b)
+        if cmp(s, self.m) >= 0 {
+            return padded(sub(s, self.m), self.k)
+        }
+        return padded(s, self.k)
+    }
+
+    /// a - b mod m (both below m; any form).
+    pub fn sub(self: *Self, a: []u32, b: []u32) -> List(u32) {
+        if cmp(a, b) >= 0 {
+            return padded(sub(a, b), self.k)
+        }
+        return padded(sub(add(a, self.m), b), self.k)
+    }
+
+    /// a^e mod m, in Montgomery form, for a big-endian exponent.
+    pub fn pow(self: *Self, a: []u32, e: []u8) -> List(u32) {
+        var acc = self.one.clone()
+        for byte in e {
+            var bitmask: u8 = 0x80
+            while bitmask != 0 {
+                acc = self.mul(acc, acc)
+                if (byte & bitmask) != 0 {
+                    acc = self.mul(acc, a)
+                }
+                bitmask >>= 1
+            }
+        }
+        return acc
+    }
+
+    /// 1/a mod m for a prime m, in Montgomery form (Fermat: a^(m-2)).
+    pub fn invert(self: *Self, a: []u32) -> List(u32) {
+        let e = sub(self.m, small(2))
+        return self.pow(a, to_be(e, (bits(e) + 7) / 8))
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.bytes
+
+fn hex_of(a: []u32) -> String {
+    return bytes.hex(to_be(a, (bits(a) + 7) / 8))
+}
+
+fn num(h: []u8) -> List(u32) {
+    return from_be(bytes.unhex(h) catch {
+        panic("hex")
+    })
+}
+
+test "big-endian in and out, comparing, adding and subtracting" {
+    let a = num("0100000000000000000000000000000001")
+    expect_eq(a.len, 5)
+    expect_eq(bits(a), 129)
+    expect_eq(hex_of(a), "0100000000000000000000000000000001")
+    expect_eq(bytes.hex(to_be(a, 20)), "0000000100000000000000000000000000000001")
+    let b = num("ffffffffffffffffffffffffffffffff")
+    expect_eq(hex_of(add(a, b)), "0200000000000000000000000000000000")
+    expect_eq(hex_of(sub(a, b)), "02")
+    expect(cmp(a, b) == 1 and cmp(b, a) == -1 and cmp(a, a) == 0)
+    expect(cmp(num("0001"), small(1)) == 0)
+    expect(is_zero(sub(a, a)))
+    expect_eq(hex_of(shr(a, 128)), "01")
+    expect_eq(hex_of(low_bits(b, 36)), "0fffffffff")
+}
+
+test "Montgomery: products, powers and inverses against known answers" {
+    // m = 2^127 - 1, a prime
+    let m = num("7fffffffffffffffffffffffffffffff")
+    let ctx = mont(m).?
+    let a = num("123456789abcdef0fedcba9876543210")
+    let b = num("0fedcba98765432100123456789abcde")
+    // a * b mod m, computed in Python
+    let am = ctx.to(ctx.reduce(a))
+    let bm = ctx.to(b)
+    expect_eq(hex_of(ctx.from(ctx.mul(am, bm))), "1bd9ab665fed6427975c1e9a8badbc73")
+    // Fermat: a^(m-1) = 1, and a * a^-1 = 1
+    let e = bytes.unhex("7ffffffffffffffffffffffffffffffe") catch {
+        panic("hex")
+    }
+    expect_eq(hex_of(ctx.from(ctx.pow(am, e))), "01")
+    expect_eq(hex_of(ctx.from(ctx.mul(am, ctx.invert(am)))), "01")
+    // an even modulus has no context
+    expect(mont(num("10")) == null)
+}

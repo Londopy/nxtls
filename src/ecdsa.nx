@@ -1,0 +1,269 @@
+// ecdsa.nx: ECDSA signature verification on NIST P-256 and P-384 (FIPS
+// 186-5, SEC 1), for certificates and TLS 1.3's CertificateVerify. Verify
+// only.
+//
+// `import nxtls.ecdsa` then:
+//
+//     if !ecdsa.verify(ecdsa.Curve.P256, public_key, hash, signature) { ... }
+//
+// The public key is an uncompressed point (0x04, x, y), which must lie on
+// the curve; the hash is the message's digest (truncated to the order's
+// length when it is longer, as FIPS 186 says); the signature is DER, a
+// SEQUENCE of r and s as X.509 and TLS carry it (verify_raw takes r and s
+// as big-endian bytes instead).
+//
+// Everything is public (keys, hashes, signatures), so this is ordinary
+// variable-time code over bn.nx. Points are Jacobian (X/Z^2, Y/Z^3) in
+// Montgomery form, with the a = -3 formulas of the Explicit-Formulas
+// Database (dbl-2001-b, add-2007-bl); u1 G + u2 Q is one double-and-add
+// over both scalars (Shamir's trick).
+
+import bn
+import der
+import tables
+
+pub enum Curve {
+    P256,
+    P384,
+}
+
+struct Params {
+    f: bn.Mont
+    n: bn.Mont
+    /// b, G's x and y in Montgomery form mod p
+    b: List(u32)
+    gx: List(u32)
+    gy: List(u32)
+    /// bytes in a coordinate and in a scalar
+    size: usize
+}
+
+fn params(c: Curve) -> Params {
+    if c == Curve.P384 {
+        return build(tables.P384_P[..], tables.P384_N[..], tables.P384_B[..], tables.P384_GX[..], tables.P384_GY[..], 48)
+    }
+    return build(tables.P256_P[..], tables.P256_N[..], tables.P256_B[..], tables.P256_GX[..], tables.P256_GY[..], 32)
+}
+
+fn build(p: []u8, n: []u8, b: []u8, gx: []u8, gy: []u8, size: usize) -> Params {
+    let f = bn.mont(bn.from_be(p)).?
+    let order = bn.mont(bn.from_be(n)).?
+    let bm = f.to(bn.from_be(b))
+    let xm = f.to(bn.from_be(gx))
+    let ym = f.to(bn.from_be(gy))
+    return Params{ .f = f, .n = order, .b = bm, .gx = xm, .gy = ym, .size = size }
+}
+
+struct Point {
+    x: List(u32)
+    y: List(u32)
+    /// zero for the point at infinity
+    z: List(u32)
+}
+
+fn infinity(f: *bn.Mont) -> Point {
+    return Point{ .x = f.one.clone(), .y = f.one.clone(), .z = bn.small(0) }
+}
+
+fn is_inf(p: *Point) -> bool {
+    return bn.is_zero(p.z)
+}
+
+// 2P (dbl-2001-b, a = -3)
+fn double(f: *bn.Mont, p: *Point) -> Point {
+    if is_inf(p) or bn.is_zero(p.y) {
+        return infinity(f)
+    }
+    let delta = f.mul(p.z, p.z)
+    let gamma = f.mul(p.y, p.y)
+    let beta = f.mul(p.x, gamma)
+    let t = f.mul(f.sub(p.x, delta), f.add(p.x, delta))
+    let alpha = f.add(f.add(t, t), t)
+    let beta2 = f.add(beta, beta)
+    let beta4 = f.add(beta2, beta2)
+    let beta8 = f.add(beta4, beta4)
+    let x3 = f.sub(f.mul(alpha, alpha), beta8)
+    let yz = f.add(p.y, p.z)
+    let z3 = f.sub(f.sub(f.mul(yz, yz), gamma), delta)
+    let g2 = f.mul(gamma, gamma)
+    let g4 = f.add(g2, g2)
+    let g8 = f.add(f.add(g4, g4), f.add(g4, g4))
+    let y3 = f.sub(f.mul(alpha, f.sub(beta4, x3)), g8)
+    return Point{ .x = x3, .y = y3, .z = z3 }
+}
+
+// P + Q (add-2007-bl)
+fn add_points(f: *bn.Mont, p: *Point, q: *Point) -> Point {
+    if is_inf(p) {
+        return Point{ .x = q.x.clone(), .y = q.y.clone(), .z = q.z.clone() }
+    }
+    if is_inf(q) {
+        return Point{ .x = p.x.clone(), .y = p.y.clone(), .z = p.z.clone() }
+    }
+    let z1z1 = f.mul(p.z, p.z)
+    let z2z2 = f.mul(q.z, q.z)
+    let u1 = f.mul(p.x, z2z2)
+    let u2 = f.mul(q.x, z1z1)
+    let s1 = f.mul(f.mul(p.y, q.z), z2z2)
+    let s2 = f.mul(f.mul(q.y, p.z), z1z1)
+    let h = f.sub(u2, u1)
+    let rr = f.sub(s2, s1)
+    if bn.is_zero(h) {
+        // the same x: the same point (double it), or P + (-P)
+        if bn.is_zero(rr) {
+            return double(f, p)
+        }
+        return infinity(f)
+    }
+    let h2 = f.add(h, h)
+    let i = f.mul(h2, h2)
+    let j = f.mul(h, i)
+    let r = f.add(rr, rr)
+    let v = f.mul(u1, i)
+    let x3 = f.sub(f.sub(f.mul(r, r), j), f.add(v, v))
+    let s1j = f.mul(s1, j)
+    let y3 = f.sub(f.mul(r, f.sub(v, x3)), f.add(s1j, s1j))
+    let zz = f.add(p.z, q.z)
+    let z3 = f.mul(f.sub(f.sub(f.mul(zz, zz), z1z1), z2z2), h)
+    return Point{ .x = x3, .y = y3, .z = z3 }
+}
+
+// the public key as a point, when it is an uncompressed point on the curve
+fn decode(c: *Params, public: []u8) -> ?Point {
+    if public.len != 1 + 2 * c.size or public[0] != 0x04 {
+        return null
+    }
+    let x = bn.from_be(public[1..1 + c.size])
+    let y = bn.from_be(public[1 + c.size..public.len])
+    if bn.cmp(x, c.f.m) >= 0 or bn.cmp(y, c.f.m) >= 0 {
+        return null
+    }
+    let f = &c.f
+    let xm = f.to(x)
+    let ym = f.to(y)
+    // y^2 = x^3 - 3x + b
+    let lhs = f.mul(ym, ym)
+    let x3 = f.mul(f.mul(xm, xm), xm)
+    let three_x = f.add(f.add(xm, xm), xm)
+    let rhs = f.add(f.sub(x3, three_x), c.b)
+    if bn.cmp(lhs, rhs) != 0 {
+        return null
+    }
+    return Point{ .x = xm, .y = ym, .z = f.one.clone() }
+}
+
+/// Whether (r, s), big-endian, is a valid signature on `hash` by the
+/// public key (0x04, x, y) on curve `c`.
+pub fn verify_raw(c: Curve, public: []u8, hash: []u8, r: []u8, s: []u8) -> bool {
+    let cp = params(c)
+    let q = decode(&cp, public) orelse return false
+    let n = &cp.n
+    let rn = bn.from_be(r)
+    let sn = bn.from_be(s)
+    // 0 < r, s < n
+    if bn.is_zero(rn) or bn.is_zero(sn) or bn.cmp(rn, n.m) >= 0 or bn.cmp(sn, n.m) >= 0 {
+        return false
+    }
+    // the hash's leftmost bits, as many as the order has (both curves' orders
+    // fill whole bytes), mod n
+    let h = if hash.len > cp.size { hash[0..cp.size] } else { hash }
+    let e = n.reduce(bn.from_be(h))
+    let w = n.invert(n.to(sn))
+    let u1 = n.from(n.mul(n.to(e), w))
+    let u2 = n.from(n.mul(n.to(rn), w))
+    // u1 G + u2 Q
+    let f = &cp.f
+    let g = Point{ .x = cp.gx.clone(), .y = cp.gy.clone(), .z = f.one.clone() }
+    let gq = add_points(f, &g, &q)
+    var acc = infinity(f)
+    var i = @max(bn.bits(u1), bn.bits(u2))
+    while i > 0 {
+        i -= 1
+        acc = double(f, &acc)
+        let a = bn.bit(u1, i)
+        let b = bn.bit(u2, i)
+        if a and b {
+            acc = add_points(f, &acc, &gq)
+        } else if a {
+            acc = add_points(f, &acc, &g)
+        } else if b {
+            acc = add_points(f, &acc, &q)
+        }
+    }
+    if is_inf(&acc) {
+        return false
+    }
+    // x = X / Z^2, then mod n
+    let zi = f.invert(acc.z)
+    let x = f.from(f.mul(acc.x, f.mul(zi, zi)))
+    let v = n.reduce(x)
+    return bn.cmp(v, rn) == 0
+}
+
+/// Whether the DER signature (a SEQUENCE of the INTEGERs r and s, and
+/// nothing after it) is valid on `hash` by the public key on curve `c`.
+pub fn verify(c: Curve, public: []u8, hash: []u8, signature: []u8) -> bool {
+    let seq = der.expect_tag(signature, 0, signature.len, 0x30) orelse return false
+    if seq.end != signature.len {
+        return false
+    }
+    let rt = der.expect_tag(signature, seq.body, seq.end, 0x02) orelse return false
+    let st = der.expect_tag(signature, rt.end, seq.end, 0x02) orelse return false
+    if st.end != seq.end {
+        return false
+    }
+    let r = der.positive(signature, rt) orelse return false
+    let s = der.positive(signature, st) orelse return false
+    return verify_raw(c, public, hash, r, s)
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.fs
+import testvec
+
+test "the curves: G lies on each, and n G is the point at infinity" {
+    for c in [Curve.P256, Curve.P384] {
+        let cp = params(c)
+        let f = &cp.f
+        let g = Point{ .x = cp.gx.clone(), .y = cp.gy.clone(), .z = f.one.clone() }
+        // G through decode: on the curve
+        var enc = String.new()
+        enc.push_byte(0x04)
+        enc.append(bn.to_be(f.from(cp.gx), cp.size))
+        enc.append(bn.to_be(f.from(cp.gy), cp.size))
+        expect(decode(&cp, enc) != null)
+        // n G = O, by double-and-add over n's bits
+        var acc = infinity(f)
+        var i = bn.bits(cp.n.m)
+        while i > 0 {
+            i -= 1
+            acc = double(f, &acc)
+            if bn.bit(cp.n.m, i) {
+                acc = add_points(f, &acc, &g)
+            }
+        }
+        expect(is_inf(&acc))
+    }
+}
+
+test "the vectors: Python's cryptography package agrees, strictness marked" {
+    let text = fs.read("tests/vectors/ecdsa.txt") catch {
+        panic("tests/vectors/ecdsa.txt")
+    }
+    var n = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let c = if f[1] == "p384" { Curve.P384 } else { Curve.P256 }
+        let got = verify(c, testvec.unhex(f[2]), testvec.unhex(f[3]), testvec.unhex(f[4]))
+        if got != (f[0] == "valid") {
+            println("ecdsa vector {} ({}) gave {}", .{n, f[5], got})
+        }
+        expect(got == (f[0] == "valid"))
+        n += 1
+    }
+    expect(n >= 80)
+}

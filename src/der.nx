@@ -1,0 +1,132 @@
+// der.nx: reading DER (ITU-T X.690), the encoding of X.509 certificates
+// and of ECDSA signatures in TLS.
+//
+// Strict, as a verifier should be: single-byte tags only (X.509 needs no
+// others), definite lengths in their shortest form, and elements that stay
+// inside what contains them. Everything read here is public, so this is
+// ordinary code; a malformed input gives null, never a panic.
+
+/// One element: its tag, and where its body and the element end in the
+/// input (offsets).
+pub struct Tlv {
+    tag: u8
+    start: usize
+    body: usize
+    end: usize
+}
+
+/// The element at `at` in `b`, not reaching past `limit`; null when it is
+/// malformed or runs past the limit.
+pub fn read(b: []u8, at: usize, limit: usize) -> ?Tlv {
+    if limit > b.len or at + 2 > limit {
+        return null
+    }
+    let tag = b[at]
+    // multi-byte tags (low bits all ones) are not used in X.509
+    if (tag & 0x1f) == 0x1f {
+        return null
+    }
+    let first = b[at + 1]
+    var len: usize = 0
+    var body = at + 2
+    if first < 0x80 {
+        len = first as usize
+    } else {
+        let n = (first & 0x7f) as usize
+        // no indefinite lengths; at most 3 length bytes (16 MB)
+        if n == 0 or n > 3 or at + 2 + n > limit {
+            return null
+        }
+        for i in 0..n {
+            len = (len << 8) | (b[at + 2 + i] as usize)
+        }
+        // the shortest form: a long form only past 127, no leading zero
+        if len < 0x80 or b[at + 2] == 0 {
+            return null
+        }
+        body = at + 2 + n
+    }
+    if body + len > limit {
+        return null
+    }
+    return Tlv{ .tag = tag, .start = at, .body = body, .end = body + len }
+}
+
+/// The element at `at` if it has tag `tag`.
+pub fn expect_tag(b: []u8, at: usize, limit: usize, tag: u8) -> ?Tlv {
+    let t = read(b, at, limit) orelse return null
+    if t.tag != tag {
+        return null
+    }
+    return t
+}
+
+/// The magnitude of a positive INTEGER (tag 2), without its sign byte;
+/// null for a negative, empty or non-minimal one.
+pub fn positive(b: []u8, t: Tlv) -> ?[]u8 {
+    if t.tag != 0x02 or t.end == t.body {
+        return null
+    }
+    let v = b[t.body..t.end]
+    if (v[0] & 0x80) != 0 {
+        return null
+    }
+    if v[0] == 0 {
+        // a zero byte only when the next has its top bit set
+        if v.len == 1 {
+            return v
+        }
+        if (v[1] & 0x80) == 0 {
+            return null
+        }
+        return v[1..v.len]
+    }
+    return v
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.bytes
+
+fn raw(h: []u8) -> String {
+    return bytes.unhex(h) catch {
+        panic("hex")
+    }
+}
+
+test "lengths in their shortest form only, inside what holds them" {
+    let a = raw("300602010102017f")
+    let seq = read(a, 0, a.len).?
+    expect(seq.tag == 0x30 and seq.body == 2 and seq.end == 8)
+    let one = read(a, seq.body, seq.end).?
+    expect_eq(bytes.hex(positive(a, one).?), "01")
+    let two = read(a, one.end, seq.end).?
+    expect_eq(bytes.hex(positive(a, two).?), "7f")
+    // a long form for a short length, an indefinite length, running past
+    expect(read(raw("30810100"), 0, 4) == null)
+    expect(read(raw("3080"), 0, 2) == null)
+    expect(read(raw("3005020101"), 0, 5) == null)
+    expect(read(raw("1f0100"), 0, 3) == null)
+    // 200 bytes: the long form with one length byte is right
+    var long = String.new()
+    long.push_byte(0x04)
+    long.push_byte(0x81)
+    long.push_byte(200)
+    for _ in 0..200 {
+        long.push_byte(0x55)
+    }
+    expect_eq(read(long, 0, long.len).?.end, 203)
+}
+
+test "positive integers: no sign bit, no needless zero" {
+    let ok = raw("020300ff01")
+    expect_eq(bytes.hex(positive(ok, read(ok, 0, ok.len).?).?), "ff01")
+    let negative = raw("0201ff")
+    expect(positive(negative, read(negative, 0, negative.len).?) == null)
+    let padded = raw("0202007f")
+    expect(positive(padded, read(padded, 0, padded.len).?) == null)
+    let zero = raw("020100")
+    expect_eq(bytes.hex(positive(zero, read(zero, 0, zero.len).?).?), "00")
+    let empty = raw("0200")
+    expect(positive(empty, read(empty, 0, empty.len).?) == null)
+}
