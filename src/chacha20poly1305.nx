@@ -285,7 +285,6 @@ pub fn open(key: []u8, nonce: []u8, aad: []u8, sealed: []u8) -> ?String {
 // ------------------------------------------------------------------ tests
 
 import std.bytes
-import std.fs
 import testvec
 
 test "RFC 8439 2.1.1: the quarter round" {
@@ -302,9 +301,7 @@ test "RFC 8439 2.1.1: the quarter round" {
 }
 
 test "ChaCha20: RFC 8439 A.1, A.2 and A.4, and random lengths and counters" {
-    let text = fs.read("tests/vectors/chacha20.txt") catch {
-        panic("tests/vectors/chacha20.txt")
-    }
+    let text = @embedFile("../tests/vectors/chacha20.txt")
     var n = 0
     for line in text.lines() {
         if !testvec.is_vector(line) {
@@ -323,9 +320,7 @@ test "ChaCha20: RFC 8439 A.1, A.2 and A.4, and random lengths and counters" {
 }
 
 test "Poly1305: RFC 8439 A.3, the carries and the final reduction, and random" {
-    let text = fs.read("tests/vectors/poly1305.txt") catch {
-        panic("tests/vectors/poly1305.txt")
-    }
+    let text = @embedFile("../tests/vectors/poly1305.txt")
     var n = 0
     for line in text.lines() {
         if !testvec.is_vector(line) {
@@ -340,9 +335,7 @@ test "Poly1305: RFC 8439 A.3, the carries and the final reduction, and random" {
 }
 
 test "the AEAD: RFC 8439 2.8.2 and A.5, random, and every kind of tampering refused" {
-    let text = fs.read("tests/vectors/chacha20poly1305.txt") catch {
-        panic("tests/vectors/chacha20poly1305.txt")
-    }
+    let text = @embedFile("../tests/vectors/chacha20poly1305.txt")
     var n = 0
     for line in text.lines() {
         if !testvec.is_vector(line) {

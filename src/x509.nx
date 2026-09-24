@@ -836,7 +836,6 @@ fn path(cur: *Cert, below: usize, pool: *List(Cert), used: *mut List(bool), now:
 
 // ------------------------------------------------------------------ tests
 
-import std.fs
 import testvec
 
 test "host names: exact, case, a trailing dot, and wildcards only as whole first labels" {
@@ -886,10 +885,8 @@ fn der_named(n: *Named, name: []u8) -> String {
     return String.new()
 }
 
-fn vectors() -> String {
-    return fs.read("tests/vectors/x509.txt") catch {
-        panic("tests/vectors/x509.txt")
-    }
+fn vectors() -> []u8 {
+    return @embedFile("../tests/vectors/x509.txt")
 }
 
 fn kind_text(k: KeyKind) -> []u8 {
@@ -1020,19 +1017,15 @@ test "the vectors: chains, as Python's cryptography verifier judges them" {
 test "the captured chains and roots load from PEM as the vectors have them" {
     let text = vectors()
     let certs = named_certs(text)
-    for host in ["discord.com", "gateway.discord.gg", "callook.info"] {
-        let file = fs.read(format("tests/certs/{}.pem", .{host})) catch {
-            panic("tests/certs")
-        }
-        let blocks = pem.decode_all(file, "CERTIFICATE")
+    let files = [@embedFile("../tests/certs/discord.com.pem"), @embedFile("../tests/certs/gateway.discord.gg.pem"), @embedFile("../tests/certs/callook.info.pem")]
+    for host, k in ["discord.com", "gateway.discord.gg", "callook.info"] {
+        let blocks = pem.decode_all(files[k], "CERTIFICATE")
         expect_eq(blocks.len, 3)
         for b, i in blocks {
             expect(b == der_named(&certs, format("{}/{}", .{host, i})))
         }
     }
-    let bundle = fs.read("tests/certs/roots.pem") catch {
-        panic("tests/certs/roots.pem")
-    }
+    let bundle = @embedFile("../tests/certs/roots.pem")
     let roots = store_from_pem(bundle)
     // the zero serial, the P-521 key and the SHA-1 self-signature load too
     expect_eq(roots.certs.len, 6)

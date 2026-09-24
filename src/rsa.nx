@@ -174,13 +174,10 @@ pub fn verify_pss(n: []u8, e: []u8, kind: sha2.Kind, hash: []u8, signature: []u8
 
 // ------------------------------------------------------------------ tests
 
-import std.fs
 import testvec
 
 test "the vectors: 2048 to 4096 bits, PKCS1-v1_5 and PSS, and what must fail" {
-    let text = fs.read("tests/vectors/rsa.txt") catch {
-        panic("tests/vectors/rsa.txt")
-    }
+    let text = @embedFile("../tests/vectors/rsa.txt")
     var n = 0
     for line in text.lines() {
         if !testvec.is_vector(line) {

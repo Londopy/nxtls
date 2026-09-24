@@ -1367,7 +1367,6 @@ impl Conn {
 
 // ------------------------------------------------------------------ tests
 
-import std.fs
 import testvec
 
 test "the HelloRetryRequest random is SHA-256 of its name" {
@@ -1387,9 +1386,7 @@ fn field(text: []u8, name: []u8) -> String {
 }
 
 test "RFC 8448's simple handshake: the shared secret, the key schedule and both Finished" {
-    let text = fs.read("tests/vectors/tls13_rfc8448.txt") catch {
-        panic("tests/vectors/tls13_rfc8448.txt")
-    }
+    let text = @embedFile("../tests/vectors/tls13_rfc8448.txt")
     let shared = x25519.shared(field(text, "client_private"), field(text, "server_public")) catch {
         panic("x25519")
     }
@@ -1438,9 +1435,7 @@ fn state_named(name: []u8) -> u8 {
 }
 
 test "the vectors: whole exchanges with a server gen.py plays, byte for byte" {
-    let text = fs.read("tests/vectors/tls13.txt") catch {
-        panic("tests/vectors/tls13.txt")
-    }
+    let text = @embedFile("../tests/vectors/tls13.txt")
     var name = String.new()
     var host = String.new()
     var now: i64 = 0

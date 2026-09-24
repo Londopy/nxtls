@@ -219,7 +219,6 @@ pub fn verify(c: Curve, public: []u8, hash: []u8, signature: []u8) -> bool {
 
 // ------------------------------------------------------------------ tests
 
-import std.fs
 import testvec
 
 test "the curves: G lies on each, and n G is the point at infinity" {
@@ -248,9 +247,7 @@ test "the curves: G lies on each, and n G is the point at infinity" {
 }
 
 test "the vectors: Python's cryptography package agrees, strictness marked" {
-    let text = fs.read("tests/vectors/ecdsa.txt") catch {
-        panic("tests/vectors/ecdsa.txt")
-    }
+    let text = @embedFile("../tests/vectors/ecdsa.txt")
     var n = 0
     for line in text.lines() {
         if !testvec.is_vector(line) {

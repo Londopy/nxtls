@@ -96,7 +96,6 @@ pub fn shared(k: []u8, their_public: []u8) -> ![32]u8 {
 // ------------------------------------------------------------------ tests
 
 import std.bytes
-import std.fs
 import testvec
 
 fn hex(b: [32]u8) -> String {
@@ -175,9 +174,7 @@ test "a peer key of small order is refused, and the top bit of u is ignored" {
 }
 
 test "the vectors from Python's cryptography package" {
-    let text = fs.read("tests/vectors/x25519.txt") catch {
-        panic("tests/vectors/x25519.txt")
-    }
+    let text = @embedFile("../tests/vectors/x25519.txt")
     var n = 0
     for line in text.lines() {
         if !testvec.is_vector(line) {
