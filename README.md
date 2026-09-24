@@ -36,6 +36,7 @@ radio club, which checks every request's Ed25519 signature with it.
 | module | what | tested against |
 | --- | --- | --- |
 | `sha2` | SHA-256, SHA-384, SHA-512 | FIPS 180-4 messages, every padding boundary, a million a's |
+| `sha1` | SHA-1, and the WebSocket handshake's `Sec-WebSocket-Accept` (never for signatures or integrity: SHA-1 is broken) | FIPS 180-4 messages, every padding boundary, a million a's, RFC 6455's example |
 | `hmac` | HMAC over each of them, constant-time `verify` | RFC 4231, keys either side of the block size |
 | `hkdf` | HKDF extract and expand, TLS 1.3 `expand_label` and `derive_secret` | RFC 5869, RFC 8448's early and derived secrets |
 | `ed25519` | signature verification (verify only) | RFC 8032, random keys, tampering, S + L, non-canonical and small-order inputs |
@@ -50,7 +51,7 @@ cases where that differs from a permissive verifier such as OpenSSL's.
 
 ```toml
 [dependencies]
-nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.1.0" }
+nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.2.0" }
 ```
 
 ```nexium
@@ -70,6 +71,7 @@ if !ed25519.verify(public_key, message, signature) { ... }
 ```sh
 nx test src/hkdf.nx                    # also runs the tests of what it imports
 nx test src/ed25519.nx
+nx test src/sha1.nx
 python tools/gen.py --check            # the vectors and tables are current
 ```
 
@@ -87,14 +89,14 @@ tables and vectors are current.
 
 The order lets each piece be tested alone:
 
-1. ~~SHA-2, HMAC and HKDF~~
+1. ~~SHA-2, HMAC and HKDF~~ (and SHA-1, for WebSocket)
 2. ~~Ed25519 verification~~
 3. ChaCha20-Poly1305 and X25519
 4. DER, PEM, X.509, RSA and ECDSA verification
 5. The record layer and the TLS 1.3 handshake: replayed against RFC 8448
    byte for byte, then live hosts, with badssl.com's broken hosts as
    negative tests
-6. Secure randomness
+6. Secure randomness (waits on an OS entropy source in Nexium's std)
 
 Code that touches secrets (X25519, HMAC and HKDF over traffic secrets,
 ChaCha20-Poly1305) is written constant time: fixed-length loops, no early

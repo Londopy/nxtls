@@ -1,0 +1,205 @@
+// sha1.nx: SHA-1 (FIPS 180-4), for protocols that still require it.
+//
+// `import nxtls.sha1` then:
+//
+//     let d = sha1.sha1("abc")                // 20 bytes
+//     var h = sha1.Sha1.new()
+//     h.update(first)
+//     let d2 = h.finish()
+//
+// SHA-1 is broken for collision resistance: never use it to sign, to
+// identify content, or to protect anything. It is here because the
+// WebSocket handshake (RFC 6455) defines Sec-WebSocket-Accept with it,
+// where it only proves the server read the request; `websocket_accept`
+// computes that value.
+
+import std.bytes
+
+fn rotl32(x: u32, n: u32) -> u32 {
+    return (x << n) | (x >> (32 - n))
+}
+
+fn compress(h: *mut [5]u32, block: []u8) {
+    var w: [80]u32 = undefined
+    for t in 0..16 {
+        let j = t * 4
+        w[t] = ((block[j] as u32) << 24) | ((block[j + 1] as u32) << 16) | ((block[j + 2] as u32) << 8) | (block[j + 3] as u32)
+    }
+    for t in 16..80 {
+        w[t] = rotl32(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1)
+    }
+    var a = h[0]
+    var b = h[1]
+    var c = h[2]
+    var d = h[3]
+    var e = h[4]
+    for t in 0..80 {
+        var f: u32 = 0
+        var k: u32 = 0
+        if t < 20 {
+            f = (b & c) | (~b & d)
+            k = 0x5a827999
+        } else if t < 40 {
+            f = b ^ c ^ d
+            k = 0x6ed9eba1
+        } else if t < 60 {
+            f = (b & c) | (b & d) | (c & d)
+            k = 0x8f1bbcdc
+        } else {
+            f = b ^ c ^ d
+            k = 0xca62c1d6
+        }
+        let temp = rotl32(a, 5) +% f +% e +% k +% w[t]
+        e = d
+        d = c
+        c = rotl32(b, 30)
+        b = a
+        a = temp
+    }
+    h[0] = h[0] +% a
+    h[1] = h[1] +% b
+    h[2] = h[2] +% c
+    h[3] = h[3] +% d
+    h[4] = h[4] +% e
+}
+
+/// A running SHA-1. Copying it snapshots the running hash.
+pub struct Sha1 {
+    h: [5]u32
+    block: [64]u8
+    used: usize
+    total: u64
+}
+
+impl Sha1 {
+    pub fn new() -> Sha1 {
+        return Sha1{ .h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0], .block = undefined, .used = 0, .total = 0 }
+    }
+
+    fn push(self: *mut Self, b: u8) {
+        self.block[self.used] = b
+        self.used += 1
+        if self.used == 64 {
+            compress(&mut self.h, self.block[..])
+            self.used = 0
+        }
+    }
+
+    pub fn update(self: *mut Self, data: []u8) {
+        self.total +%= data.len as u64
+        var i: usize = 0
+        while i < data.len {
+            if self.used == 0 and data.len - i >= 64 {
+                compress(&mut self.h, data[i..i + 64])
+                i += 64
+            } else {
+                self.push(data[i])
+                i += 1
+            }
+        }
+    }
+
+    /// The 20-byte digest; the hasher is spent afterwards.
+    pub fn finish(self: *mut Self) -> String {
+        let bits = self.total *% 8
+        self.push(0x80)
+        while self.used != 56 {
+            self.push(0)
+        }
+        for i in 0..8 {
+            self.push(@truncate(u8, bits >> ((56 - 8 * i) as u64)))
+        }
+        var out = String.with_capacity(20)
+        for v in self.h {
+            out.push_byte(@truncate(u8, v >> 24))
+            out.push_byte(@truncate(u8, v >> 16))
+            out.push_byte(@truncate(u8, v >> 8))
+            out.push_byte(@truncate(u8, v))
+        }
+        return out
+    }
+}
+
+/// SHA-1 of `data`, 20 bytes.
+pub fn sha1(data: []u8) -> String {
+    var h = Sha1.new()
+    h.update(data)
+    return h.finish()
+}
+
+/// The Sec-WebSocket-Accept a server must answer a Sec-WebSocket-Key with
+/// (RFC 6455 section 4.2.2): base64 of SHA-1 of the key and a fixed GUID.
+pub fn websocket_accept(key: []u8) -> String {
+    var h = Sha1.new()
+    h.update(key)
+    h.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    return bytes.base64(h.finish())
+}
+
+// ------------------------------------------------------------------ tests
+
+import testvec
+
+// byte i of test message n; tools/gen.py has the same generator
+fn pattern(n: usize) -> String {
+    var out = String.with_capacity(n)
+    for i in 0..n {
+        out.push_byte(@truncate(u8, i * 31 + n))
+    }
+    return out
+}
+
+test "known answers: FIPS 180-4 messages, every padding boundary, a million a's" {
+    let text = @embedFile("../tests/vectors/sha1.txt")
+    var count: usize = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        var got = String.new()
+        if f[0] == "million-a" {
+            // fed in pieces that do not line up with the block size
+            var h = Sha1.new()
+            let piece = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            for _ in 0..10000 {
+                h.update(piece)
+            }
+            got = h.finish()
+        } else if f[0].starts_with("pattern:") {
+            got = sha1(pattern(testvec.number(f[0][8..f[0].len])))
+        } else {
+            got = sha1(testvec.unhex(f[0]))
+        }
+        expect_eq(bytes.hex(got), f[1])
+        count += 1
+    }
+    expect_eq(count, 4 + 141 + 7 + 1)
+}
+
+test "streaming in odd pieces matches one call, and a copy is a snapshot" {
+    let msg = pattern(1000)
+    let whole = sha1(msg)
+    let steps: [7]usize = [1, 3, 63, 64, 65, 129, 999]
+    for step in steps {
+        var h = Sha1.new()
+        var i: usize = 0
+        while i < msg.len {
+            let end = @min(i + step, msg.len)
+            h.update(msg[i..end])
+            i = end
+        }
+        expect_eq(h.finish(), whole)
+    }
+    var h = Sha1.new()
+    h.update("ab")
+    var snap = h
+    h.update("c")
+    snap.update("c")
+    expect_eq(bytes.hex(h.finish()), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    expect_eq(bytes.hex(snap.finish()), "a9993e364706816aba3e25717850c26c9cd0d89d")
+}
+
+test "the WebSocket handshake: RFC 6455's own example" {
+    expect_eq(websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}

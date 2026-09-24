@@ -7,13 +7,14 @@ SHA-2, the curve equation for Ed25519), and every vector under
 tests/vectors/ comes from Python's hashlib and hmac and from the
 `cryptography` package, which serve as the reference implementations
 the Nexium code has to agree with. Published values from the standards
-(FIPS 180-4, RFC 4231, RFC 5869, RFC 8032, RFC 8448) are asserted along
+(FIPS 180-4, RFC 4231, RFC 5869, RFC 6455, RFC 8032, RFC 8448) are asserted along
 the way, so a mistake here cannot quietly become a "correct" answer.
 
     python tools/gen.py           rewrite src/tables.nx and tests/vectors/
     python tools/gen.py --check   exit 1 when the files on disk differ
 """
 
+import base64
 import hashlib
 import hmac as pyhmac
 import os
@@ -233,6 +234,23 @@ def sha2_vectors():
     return "\n".join(lines) + "\n"
 
 
+def sha1_vectors():
+    # FIPS 180-4's published examples, and RFC 6455's handshake example
+    assert hashlib.sha1(b"abc").hexdigest() == "a9993e364706816aba3e25717850c26c9cd0d89d"
+    assert hashlib.sha1(NIST_MESSAGES[2]).hexdigest() == "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+    assert hashlib.sha1(b"a" * 1000000).hexdigest() == "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
+    key = b"dGhlIHNhbXBsZSBub25jZQ=="
+    accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+    assert accept == b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    lines = ["# message digest; message is hex, - for empty, pattern:N, or million-a"]
+    for m in NIST_MESSAGES:
+        lines.append("%s %s" % (hx(m), hashlib.sha1(m).hexdigest()))
+    for n in list(range(0, 141)) + [191, 192, 255, 256, 257, 1000, 4099]:
+        lines.append("pattern:%d %s" % (n, hashlib.sha1(pattern(n)).hexdigest()))
+    lines.append("million-a %s" % hashlib.sha1(b"a" * 1000000).hexdigest())
+    return "\n".join(lines) + "\n"
+
+
 RFC4231 = [
     (b"\x0b" * 20, b"Hi There"),
     (b"Jefe", b"what do ya want for nothing?"),
@@ -439,6 +457,7 @@ def ed25519_vectors():
 OUTPUTS = {
     "src/tables.nx": tables_nx,
     "tests/vectors/sha2.txt": sha2_vectors,
+    "tests/vectors/sha1.txt": sha1_vectors,
     "tests/vectors/hmac.txt": hmac_vectors,
     "tests/vectors/hkdf.txt": hkdf_vectors,
     "tests/vectors/hkdf_label.txt": hkdf_label_vectors,
