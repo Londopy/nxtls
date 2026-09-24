@@ -7,8 +7,8 @@ SHA-2, the curve equation for Ed25519), and every vector under
 tests/vectors/ comes from Python's hashlib and hmac and from the
 `cryptography` package, which serve as the reference implementations
 the Nexium code has to agree with. Published values from the standards
-(FIPS 180-4, FIPS 186-5, RFC 4231, RFC 5869, RFC 6455, RFC 7748, RFC 8032,
-RFC 8439, RFC 8448) are asserted along the way, so a mistake here cannot quietly become
+(FIPS 180-4, FIPS 186-5, RFC 4231, RFC 5869, RFC 6455, RFC 7748, RFC 8017,
+RFC 8032, RFC 8439, RFC 8448) are asserted along the way, so a mistake here cannot quietly become
 a "correct" answer. RFC 8439's vectors are in tools/rfc8439.py, extracted
 from the RFC's text rather than typed in.
 
@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.poly1305 import Poly1305
 from cryptography.hazmat.primitives.asymmetric import ec, utils as asym_utils
+from cryptography.hazmat.primitives.asymmetric import padding as pypad, rsa as pyrsa
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidSignature
@@ -776,6 +777,245 @@ def ecdsa_vectors():
     return "\n".join(lines) + "\n"
 
 
+# ------------------------------------------------------------------ RSA
+
+SMALL_PRIMES = primes(1000)[1:]
+RSA_HASHES = [("sha256", hashlib.sha256, hashes.SHA256()),
+              ("sha384", hashlib.sha384, hashes.SHA384()),
+              ("sha512", hashlib.sha512, hashes.SHA512())]
+# RFC 8017 9.2, note 1: the DER DigestInfo before the hash
+DIGEST_INFO = {
+    "sha256": bytes.fromhex("3031300d060960864801650304020105000420"),
+    "sha384": bytes.fromhex("3041300d060960864801650304020205000430"),
+    "sha512": bytes.fromhex("3051300d060960864801650304020305000440"),
+}
+
+
+def probable_prime(n):
+    """Miller-Rabin, 40 rounds with bases from the seeded RNG."""
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+    for _ in range(40):
+        x = pow(RNG.randrange(2, n - 1), d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def rand_prime(bits, e):
+    """A prime of `bits` bits with its top two set (so two of them multiply
+    to the full size), and p - 1 prime to e."""
+    while True:
+        c = RNG.getrandbits(bits) | (3 << (bits - 2)) | 1
+        if any(c % q == 0 for q in SMALL_PRIMES):
+            continue
+        if (c - 1) % e == 0 or not probable_prime(c):
+            continue
+        return c
+
+
+def rsa_key(bits, e=65537):
+    """A key of exactly `bits` bits from the seeded RNG (the reference makes
+    its own keys at random, so the vectors would change from run to run),
+    built through the reference, which checks it."""
+    a = (bits + 1) // 2
+    p = rand_prime(a, e)
+    q = rand_prime(bits - a, e)
+    n = p * q
+    assert n.bit_length() == bits
+    d = pow(e, -1, (p - 1) * (q - 1))
+    key = pyrsa.RSAPrivateNumbers(p, q, d, d % (p - 1), d % (q - 1), pow(q, -1, p),
+                                  pyrsa.RSAPublicNumbers(e, n)).private_key()
+    return {"key": key, "n": n, "e": e, "d": d, "k": (bits + 7) // 8}
+
+
+def rsa_raw(key, em):
+    """The private operation on an encoded message (which must be below n)."""
+    m = int.from_bytes(em, "big")
+    assert m < key["n"]
+    return pow(m, key["d"], key["n"]).to_bytes(key["k"], "big")
+
+
+def pkcs1_encode(k, name, digest, info=None):
+    t = (DIGEST_INFO[name] if info is None else info) + digest
+    return b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+
+
+def mgf1(fn, seed, length):
+    out = b""
+    c = 0
+    while len(out) < length:
+        out += fn(seed + c.to_bytes(4, "big")).digest()
+        c += 1
+    return out[:length]
+
+
+def pss_encode(fn, digest, salt, em_bits, trailer=0xBC, top=False):
+    """EMSA-PSS-ENCODE (RFC 8017 9.1.1) with the salt given; `top` leaves
+    the bits past emBits set, which a verifier must refuse."""
+    em_len = (em_bits + 7) // 8
+    h = fn(b"\x00" * 8 + digest + salt).digest()
+    db = b"\x00" * (em_len - len(salt) - len(h) - 2) + b"\x01" + salt
+    masked = bytearray(a ^ b for a, b in zip(db, mgf1(fn, h, len(db))))
+    spare = 8 * em_len - em_bits
+    if top:
+        masked[0] |= (0xFF << (8 - spare)) & 0xFF
+    else:
+        masked[0] &= 0xFF >> spare
+    return bytes(masked) + h + bytes([trailer])
+
+
+def pss_sign(key, fn, digest, salt_len=None, trailer=0xBC, top=False, lead=0):
+    """A PSS signature from the seeded RNG's salts: tried until the encoding
+    (with `lead` as the byte in front when EM is a byte short of n) lies
+    below n."""
+    em_bits = key["n"].bit_length() - 1
+    k = key["k"]
+    while True:
+        salt = rand_bytes(fn().digest_size if salt_len is None else salt_len)
+        em = pss_encode(fn, digest, salt, em_bits, trailer, top)
+        if len(em) < k:
+            em = bytes([lead]) + em
+        if int.from_bytes(em, "big") < key["n"]:
+            return rsa_raw(key, em)
+
+
+def ref_rsa(n, e, scheme, halg, digest, sig):
+    try:
+        public = pyrsa.RSAPublicNumbers(e, n).public_key()
+        if scheme == "pss":
+            pad = pypad.PSS(mgf=pypad.MGF1(halg), salt_length=halg.digest_size)
+        else:
+            pad = pypad.PKCS1v15()
+        public.verify(sig, digest, pad, asym_utils.Prehashed(halg))
+        return True
+    except Exception:
+        return False
+
+
+def int_hex(v):
+    return v.to_bytes(max(1, (v.bit_length() + 7) // 8), "big").hex()
+
+
+def rsa_vectors():
+    lines = ["# expect scheme hash n e digest signature what (hash: the message's digest;",
+             "# n and e big-endian; nxtls is stricter than the reference where marked strict)"]
+
+    def add(expect, scheme, name, key, digest, sig, what, strict=False, e=None):
+        what = what.replace(" ", "_") + ("_strict" if strict else "")
+        lines.append("%s %s %s %s %s %s %s %s" % (
+            expect, scheme, name, int_hex(key["n"]), int_hex(key["e"] if e is None else e),
+            hx(digest), hx(sig), what))
+
+    keys = [("2048", rsa_key(2048)), ("2049", rsa_key(2049)), ("3072", rsa_key(3072)),
+            ("4096", rsa_key(4096))]
+    other = rsa_key(2048)
+    for label, key in keys:
+        k = key["k"]
+        for name, fn, halg in RSA_HASHES:
+            digest = rand_bytes(fn().digest_size)
+            what = "%s %s" % (label, name)
+            sig = key["key"].sign(digest, pypad.PKCS1v15(), asym_utils.Prehashed(halg))
+            # the reference's signature is the encoding this file expects
+            assert sig == rsa_raw(key, pkcs1_encode(k, name, digest)), what
+            add("valid", "pkcs1", name, key, digest, sig, what)
+            pss = pss_sign(key, fn, digest)
+            add("valid", "pss", name, key, digest, pss, what)
+            full = label in ("2048", "2049") and name == "sha256"
+            some = label in ("3072", "4096") and name == "sha384"
+            if not (full or some):
+                continue
+            bad = bytearray(digest)
+            bad[RNG.randrange(len(bad))] ^= 1 << RNG.randrange(8)
+            flipped = bytearray(sig)
+            flipped[RNG.randrange(len(sig))] ^= 1 << RNG.randrange(8)
+            pflipped = bytearray(pss)
+            pflipped[RNG.randrange(len(pss))] ^= 1 << RNG.randrange(8)
+            add("invalid", "pkcs1", name, key, bytes(bad), sig, what + " hash bit flipped")
+            add("invalid", "pkcs1", name, key, digest, bytes(flipped), what + " signature bit flipped")
+            add("invalid", "pss", name, key, bytes(bad), pss, what + " hash bit flipped")
+            add("invalid", "pss", name, key, digest, bytes(pflipped), what + " signature bit flipped")
+            if not full:
+                continue
+            n_bytes = key["n"].to_bytes(k, "big")
+            add("invalid", "pkcs1", name, key, digest, n_bytes, what + " signature equal to n")
+            add("invalid", "pss", name, key, digest, n_bytes, what + " signature equal to n")
+            add("invalid", "pkcs1", name, key, digest, b"\x00" + sig,
+                what + " signature a byte long", strict=True)
+            add("invalid", "pss", name, other, digest, pss, what + " someone else's key")
+            add("invalid", "pkcs1", name, other, digest, sig, what + " someone else's key")
+            add("invalid", "pss", name, key, digest, sig, what + " PKCS1 signature as PSS")
+            add("invalid", "pkcs1", name, key, digest, pss, what + " PSS signature as PKCS1")
+            add("invalid", "pkcs1", "sha384", key, digest, sig, what + " named SHA-384")
+            # DigestInfo without the NULL parameters, which RFC 8017 requires
+            no_null = bytes.fromhex("302f300b0609608648016503040201") + b"\x04\x20"
+            add("invalid", "pkcs1", name, key, digest, rsa_raw(key, pkcs1_encode(k, name, digest, no_null)),
+                what + " DigestInfo without NULL", strict=True)
+            # a byte of garbage after the hash, one FF fewer
+            em = pkcs1_encode(k, name, digest)
+            add("invalid", "pkcs1", name, key, digest, rsa_raw(key, em[:2] + em[3:] + b"\x00"),
+                what + " garbage after the hash")
+            add("invalid", "pkcs1", name, key, digest, rsa_raw(key, b"\x00\x02" + em[2:]),
+                what + " block type 2")
+            add("invalid", "pss", name, key, digest, pss_sign(key, fn, digest, salt_len=20),
+                what + " salt of 20 bytes")
+            add("invalid", "pss", name, key, digest, pss_sign(key, fn, digest, salt_len=0),
+                what + " no salt")
+            add("invalid", "pss", name, key, digest, pss_sign(key, fn, digest, trailer=0xCC),
+                what + " trailer not BC")
+            if label == "2048":
+                add("invalid", "pss", name, key, digest, pss_sign(key, fn, digest, top=True),
+                    what + " bits past emBits set")
+            else:
+                # 2049 bits: EM is a byte shorter than n, and the byte in
+                # front of it must be zero
+                add("invalid", "pss", name, key, digest, pss_sign(key, fn, digest, lead=1),
+                    what + " byte in front of EM")
+    # e = 3: signatures still verify, and Bleichenbacher's forgery (garbage
+    # after the hash, a cube root) does not
+    e3 = rsa_key(2048, 3)
+    digest = rand_bytes(32)
+    add("valid", "pkcs1", "sha256", e3, digest,
+        e3["key"].sign(digest, pypad.PKCS1v15(), asym_utils.Prehashed(hashes.SHA256())), "e3")
+    add("valid", "pss", "sha256", e3, digest, pss_sign(e3, hashlib.sha256, digest), "e3")
+    prefix = b"\x00\x01\xff\x00" + DIGEST_INFO["sha256"] + digest
+    shift = 8 * (e3["k"] - len(prefix))
+    forged = icbrt(int.from_bytes(prefix, "big") << shift) + 1
+    assert (forged ** 3) >> shift == int.from_bytes(prefix, "big") and forged ** 3 < e3["n"]
+    add("invalid", "pkcs1", "sha256", e3, digest, forged.to_bytes(e3["k"], "big"),
+        "e3 Bleichenbacher forgery")
+    # below 2048 bits nxtls refuses the key; e = 1 would make every encoding
+    # its own signature
+    small = rsa_key(1024)
+    digest = rand_bytes(32)
+    add("invalid", "pkcs1", "sha256", small, digest,
+        small["key"].sign(digest, pypad.PKCS1v15(), asym_utils.Prehashed(hashes.SHA256())),
+        "1024 bits", strict=True)
+    add("invalid", "pss", "sha256", small, digest, pss_sign(small, hashlib.sha256, digest),
+        "1024 bits", strict=True)
+    key = keys[0][1]
+    add("invalid", "pkcs1", "sha256", key, digest, pkcs1_encode(key["k"], "sha256", digest),
+        "e1", strict=True, e=1)
+    # the reference agrees with every expectation that is not marked strict
+    halgs = {name: halg for name, _, halg in RSA_HASHES}
+    for line in lines:
+        if line.startswith("#") or line.endswith("_strict"):
+            continue
+        f = line.split(" ")
+        got = ref_rsa(int(f[3], 16), int(f[4], 16), f[1], halgs[f[2]], bytes.fromhex(f[5]),
+                      bytes.fromhex(f[6]))
+        assert got == (f[0] == "valid"), "the reference disagrees on " + f[7]
+    return "\n".join(lines) + "\n"
+
+
 # ------------------------------------------------------------------ main
 
 OUTPUTS = {
@@ -791,6 +1031,7 @@ OUTPUTS = {
     "tests/vectors/poly1305.txt": poly1305_vectors,
     "tests/vectors/chacha20poly1305.txt": aead_vectors,
     "tests/vectors/ecdsa.txt": ecdsa_vectors,
+    "tests/vectors/rsa.txt": rsa_vectors,
 }
 
 

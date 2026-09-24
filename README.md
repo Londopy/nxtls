@@ -43,8 +43,9 @@ radio club, which checks every request's Ed25519 signature with it.
 | `x25519` | X25519 key agreement, constant time; refuses an all-zero shared secret | RFC 7748 (the iterated test to 1000, Alice and Bob), random keys, points on the twist, u with bit 255 set, small-order points |
 | `chacha20poly1305` | ChaCha20, Poly1305 and their AEAD, constant time | RFC 8439 (every vector of its appendix, among them the Poly1305 carry and reduction cases), random lengths and counters, tampering |
 | `ecdsa` | ECDSA verification on P-256 and P-384, signatures in DER (verify only) | curve checks (G on the curve, n G at infinity), deterministic signatures from Python's cryptography, malleable s, tampering, keys off the curve, r and s out of range, strict DER |
+| `rsa` | RSA verification: PKCS #1 v1.5 (certificates) and PSS (TLS 1.3), keys of 2048 to 8192 bits (verify only) | keys of 2048, 2049, 3072 and 4096 bits made from a seed, signatures checked by Python's cryptography, PSS's emBits edge cases, salt and trailer errors, Bleichenbacher's e = 3 forgery |
 | `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
-| `bn` | big integers with Montgomery multiplication, for verification (public values only) | known products, powers and inverses; through `ecdsa` |
+| `bn` | big integers with Montgomery multiplication, for verification (public values only) | known products, powers and inverses; through `ecdsa` and `rsa` |
 | `der` | a strict DER reader: shortest lengths, positive minimal integers | malformed and non-minimal encodings |
 | `ct` | constant-time comparison | every byte value |
 
@@ -81,6 +82,7 @@ nx test src/sha1.nx
 nx test src/x25519.nx
 nx test src/chacha20poly1305.nx
 nx test src/ecdsa.nx
+nx test src/rsa.nx
 python tools/gen.py --check            # the vectors and tables are current
 ```
 

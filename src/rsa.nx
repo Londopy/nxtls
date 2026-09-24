@@ -1,0 +1,204 @@
+// rsa.nx: RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5, which
+// signs most X.509 certificates, and RSASSA-PSS, which TLS 1.3 requires in
+// CertificateVerify for RSA keys. Verify only.
+//
+// `import nxtls.rsa` then:
+//
+//     if !rsa.verify_pkcs1(n, e, sha2.Kind.Sha256, hash, signature) { ... }
+//     if !rsa.verify_pss(n, e, sha2.Kind.Sha256, hash, signature) { ... }
+//
+// The key is the modulus and the public exponent as big-endian bytes (an
+// RSAPublicKey's two INTEGERs); the hash is the message's digest. The
+// modulus must have 2048 to 8192 bits, and the signature be exactly as
+// long. PKCS1-v1_5 is checked by building the expected encoding and
+// comparing (no parsing that a forgery could fool); PSS uses MGF1 with the
+// same hash and a salt as long as the hash, as TLS 1.3 says.
+//
+// Everything is public, so this is ordinary variable-time code over bn.nx.
+
+import bn
+import sha2
+
+// the DER DigestInfo that precedes the hash in PKCS1-v1_5 (RFC 8017 9.2)
+fn digest_info(kind: sha2.Kind) -> []u8 {
+    if kind == sha2.Kind.Sha384 {
+        return b"\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"
+    }
+    if kind == sha2.Kind.Sha512 {
+        return b"\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"
+    }
+    return b"\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
+}
+
+// the modulus without leading zeros, when it is an acceptable key
+fn modulus(n: []u8, e: []u8) -> ?[]u8 {
+    var at: usize = 0
+    while at < n.len and n[at] == 0 {
+        at += 1
+    }
+    let m = n[at..n.len]
+    let nb = bn.from_be(m)
+    let bits = bn.bits(nb)
+    if bits < 2048 or bits > 8192 or (m[m.len - 1] & 1) == 0 {
+        return null
+    }
+    // e odd, at least 3, below n
+    let eb = bn.from_be(e)
+    if bn.is_zero(eb) or !bn.bit(eb, 0) or bn.cmp(eb, bn.small(3)) < 0 or bn.cmp(eb, nb) >= 0 {
+        return null
+    }
+    return m
+}
+
+/// s^e mod n as big-endian bytes of the modulus's length; null for a key
+/// out of range, a signature of the wrong length, or s >= n.
+pub fn public_op(n: []u8, e: []u8, signature: []u8) -> ?String {
+    let m = modulus(n, e) orelse return null
+    if signature.len != m.len {
+        return null
+    }
+    let nb = bn.from_be(m)
+    let s = bn.from_be(signature)
+    if bn.cmp(s, nb) >= 0 {
+        return null
+    }
+    let ctx = bn.mont(nb) orelse return null
+    let r = ctx.from(ctx.pow(ctx.to(s), e))
+    return bn.to_be(r, m.len)
+}
+
+/// Whether `signature` is a valid RSASSA-PKCS1-v1_5 signature on `hash`
+/// (the digest by `kind`) under the key (n, e).
+pub fn verify_pkcs1(n: []u8, e: []u8, kind: sha2.Kind, hash: []u8, signature: []u8) -> bool {
+    if hash.len != sha2.digest_len(kind) {
+        return false
+    }
+    let em = public_op(n, e, signature) orelse return false
+    // 00 01 FF..FF 00 DigestInfo hash, with at least 8 FF bytes
+    let info = digest_info(kind)
+    let t_len = info.len + hash.len
+    if em.len < t_len + 11 {
+        return false
+    }
+    var want = String.with_capacity(em.len)
+    want.push_byte(0)
+    want.push_byte(1)
+    for _ in 0..(em.len - t_len - 3) {
+        want.push_byte(0xff)
+    }
+    want.push_byte(0)
+    want.append(info)
+    want.append(hash)
+    return em == want
+}
+
+// MGF1 (RFC 8017 B.2.1): `len` bytes from the seed
+fn mgf1(kind: sha2.Kind, seed: []u8, len: usize) -> String {
+    var out = String.with_capacity(len)
+    var counter: u32 = 0
+    while out.len < len {
+        var block = String.from(seed)
+        block.push_byte(@truncate(u8, counter >> 24))
+        block.push_byte(@truncate(u8, counter >> 16))
+        block.push_byte(@truncate(u8, counter >> 8))
+        block.push_byte(@truncate(u8, counter))
+        let h = sha2.hash(kind, block)
+        let take = if len - out.len < h.len { len - out.len } else { h.len }
+        out.append(h[0..take])
+        counter += 1
+    }
+    return out
+}
+
+/// Whether `signature` is a valid RSASSA-PSS signature on `hash` under the
+/// key (n, e), with MGF1 over the same hash and a salt as long as the hash
+/// (TLS 1.3's rsa_pss_rsae_*).
+pub fn verify_pss(n: []u8, e: []u8, kind: sha2.Kind, hash: []u8, signature: []u8) -> bool {
+    let h_len = sha2.digest_len(kind)
+    let s_len = h_len
+    if hash.len != h_len {
+        return false
+    }
+    let m = modulus(n, e) orelse return false
+    let em_full = public_op(n, e, signature) orelse return false
+    // emBits = modBits - 1, so EM is one byte shorter when modBits is
+    // one past a whole byte, and the top bits of EM are zero
+    let mod_bits = bn.bits(bn.from_be(m))
+    let em_bits = mod_bits - 1
+    let em_len = (em_bits + 7) / 8
+    if em_len < em_full.len {
+        // the byte dropped must be zero
+        if em_full[0] != 0 {
+            return false
+        }
+    }
+    let em = em_full[em_full.len - em_len..em_full.len]
+    if em_len < h_len + s_len + 2 or em[em_len - 1] != 0xbc {
+        return false
+    }
+    let db_len = em_len - h_len - 1
+    let masked = em[0..db_len]
+    let h = em[db_len..db_len + h_len]
+    // the leftmost 8 emLen - emBits bits of EM are zero
+    let spare = (8 * em_len - em_bits) as u32
+    let top_mask = @truncate(u8, (0xff00 as u32) >> spare)
+    if (masked[0] & top_mask) != 0 {
+        return false
+    }
+    let mask = mgf1(kind, h, db_len)
+    var db = String.with_capacity(db_len)
+    for i in 0..db_len {
+        let b = masked[i] ^ mask[i]
+        db.push_byte(if i == 0 { b & ~top_mask } else { b })
+    }
+    // DB = 00..00 01 salt
+    let zeros = db_len - s_len - 1
+    for i in 0..zeros {
+        if db[i] != 0 {
+            return false
+        }
+    }
+    if db[zeros] != 1 {
+        return false
+    }
+    let salt = db[zeros + 1..db_len]
+    // H' = Hash(00 x 8, hash, salt)
+    var mp = String.new()
+    for _ in 0..8 {
+        mp.push_byte(0)
+    }
+    mp.append(hash)
+    mp.append(salt)
+    return sha2.hash(kind, mp) == h
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.fs
+import testvec
+
+test "the vectors: 2048 to 4096 bits, PKCS1-v1_5 and PSS, and what must fail" {
+    let text = fs.read("tests/vectors/rsa.txt") catch {
+        panic("tests/vectors/rsa.txt")
+    }
+    var n = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        // expect scheme hash n e digest signature what
+        let f = line.split(" ")
+        let kind = testvec.kind_named(f[2])
+        let got = if f[1] == "pss" {
+            verify_pss(testvec.unhex(f[3]), testvec.unhex(f[4]), kind, testvec.unhex(f[5]), testvec.unhex(f[6]))
+        } else {
+            verify_pkcs1(testvec.unhex(f[3]), testvec.unhex(f[4]), kind, testvec.unhex(f[5]), testvec.unhex(f[6]))
+        }
+        if got != (f[0] == "valid") {
+            println("rsa vector {} ({}) gave {}", .{n, f[7], got})
+        }
+        expect(got == (f[0] == "valid"))
+        n += 1
+    }
+    expect(n >= 70)
+}
