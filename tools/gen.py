@@ -7,8 +7,10 @@ SHA-2, the curve equation for Ed25519), and every vector under
 tests/vectors/ comes from Python's hashlib and hmac and from the
 `cryptography` package, which serve as the reference implementations
 the Nexium code has to agree with. Published values from the standards
-(FIPS 180-4, RFC 4231, RFC 5869, RFC 6455, RFC 8032, RFC 8448) are asserted along
-the way, so a mistake here cannot quietly become a "correct" answer.
+(FIPS 180-4, RFC 4231, RFC 5869, RFC 6455, RFC 7748, RFC 8032, RFC 8439,
+RFC 8448) are asserted along the way, so a mistake here cannot quietly become
+a "correct" answer. RFC 8439's vectors are in tools/rfc8439.py, extracted
+from the RFC's text rather than typed in.
 
     python tools/gen.py           rewrite src/tables.nx and tests/vectors/
     python tools/gen.py --check   exit 1 when the files on disk differ
@@ -25,11 +27,20 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.poly1305 import Poly1305
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidSignature
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from rfc8439 import RFC8439, RFC8439_COUNTERS  # noqa: E402
 RNG = random.Random(20260922)
 
 
@@ -452,6 +463,170 @@ def ed25519_vectors():
     return "\n".join(lines) + "\n"
 
 
+# ------------------------------------------------------------------ X25519
+
+
+def x25519(k, u):
+    """X25519(k, u) by the reference, or None when it is all zeros (the
+    reference refuses those)."""
+    try:
+        return X25519PrivateKey.from_private_bytes(k).exchange(X25519PublicKey.from_public_bytes(u))
+    except ValueError:
+        return None
+
+
+def x25519_vectors():
+    lines = ["# scalar u-coordinate result (RFC 7748 5.2 and 6.1, then random scalars",
+             "# against points, points on the twist, and u with bit 255 set)"]
+    rfc = [
+        ("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+         "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+         "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"),
+        ("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+         "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+         "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"),
+        # 6.1: Alice's and Bob's public keys, then their shared secret
+        ("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+         "0900000000000000000000000000000000000000000000000000000000000000",
+         "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"),
+        ("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+         "0900000000000000000000000000000000000000000000000000000000000000",
+         "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"),
+        ("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+         "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+         "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"),
+    ]
+    for k, u, out in rfc:
+        got = x25519(bytes.fromhex(k), bytes.fromhex(u))
+        assert got is not None and got.hex() == out, "RFC 7748 " + out
+        lines.append("%s %s %s" % (k, u, out))
+    n = 0
+    while n < 120:
+        k = rand_bytes(32)
+        kind = n % 4
+        if kind < 2:
+            # a real public key
+            u = X25519PrivateKey.from_private_bytes(rand_bytes(32)).public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        elif kind == 2:
+            # any 32 bytes, most of them on the twist
+            u = rand_bytes(32)
+        else:
+            # bit 255 set: ignored, as RFC 7748 says
+            u = bytearray(rand_bytes(32))
+            u[31] |= 0x80
+            u = bytes(u)
+        got = x25519(k, u)
+        if got is None:
+            continue
+        lines.append("%s %s %s" % (k.hex(), u.hex(), got.hex()))
+        n += 1
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ ChaCha20 and Poly1305
+
+
+def rfc8439(section, vector, label):
+    for s, v, name, h in RFC8439:
+        if (s, v, name) == (section, vector, label):
+            return bytes.fromhex(h)
+    raise KeyError((section, vector, label))
+
+
+def chacha20(key, counter, nonce, data):
+    """The reference's ChaCha20: its 16-byte nonce is the 32-bit counter,
+    little-endian, then the 12-byte nonce."""
+    enc = Cipher(algorithms.ChaCha20(key, counter.to_bytes(4, "little") + nonce), mode=None).encryptor()
+    return enc.update(data)
+
+
+def chacha20_vectors():
+    lines = ["# key counter nonce plaintext ciphertext (RFC 8439 A.1, A.2 and A.4,",
+             "# then random lengths and counters)"]
+
+    def add(key, counter, nonce, pt, ct):
+        assert chacha20(key, counter, nonce, pt) == ct
+        lines.append("%s %d %s %s %s" % (hx(key), counter, hx(nonce), hx(pt), hx(ct)))
+
+    for v in "12345":
+        ks = rfc8439("A.1", v, "Keystream")
+        add(rfc8439("A.1", v, "Key"), RFC8439_COUNTERS["A.1#" + v], rfc8439("A.1", v, "Nonce"), bytes(len(ks)), ks)
+    for v in "123":
+        add(rfc8439("A.2", v, "Key"), RFC8439_COUNTERS["A.2#" + v], rfc8439("A.2", v, "Nonce"),
+            rfc8439("A.2", v, "Plaintext"), rfc8439("A.2", v, "Ciphertext"))
+    # A.4: the Poly1305 key is the first 32 bytes of block 0
+    for v in "123":
+        otk = rfc8439("A.4", v, "Poly1305 one-time key")
+        add(rfc8439("A.4", v, "The ChaCha20 Key"), 0, rfc8439("A.4", v, "The nonce"), bytes(32), otk)
+    for i in range(30):
+        n = RNG.choice([0, 1, 63, 64, 65, 127, 128, 129, 300, 1000])
+        counter = RNG.choice([0, 1, 7, 12345, 2 ** 32 - 20])
+        key, nonce, pt = rand_bytes(32), rand_bytes(12), rand_bytes(n)
+        add(key, counter, nonce, pt, chacha20(key, counter, nonce, pt))
+    return "\n".join(lines) + "\n"
+
+
+def poly1305_vectors():
+    lines = ["# key message tag (RFC 8439 A.3, whose vectors 5 to 11 try the carries",
+             "# and the final reduction, then random)"]
+
+    def add(key, msg, tag):
+        assert Poly1305.generate_tag(key, msg) == tag
+        lines.append("%s %s %s" % (hx(key), hx(msg), hx(tag)))
+
+    for v in "1234":
+        add(rfc8439("A.3", v, "One-time Poly1305 Key"), rfc8439("A.3", v, "Text to MAC"), rfc8439("A.3", v, "Tag"))
+    for v in ["5", "6", "7", "8", "9", "10", "11"]:
+        add(rfc8439("A.3", v, "R") + rfc8439("A.3", v, "S"), rfc8439("A.3", v, "data"), rfc8439("A.3", v, "tag"))
+    for i in range(40):
+        n = RNG.choice([0, 1, 15, 16, 17, 31, 32, 33, 64, 100, 255, 1000])
+        key, msg = rand_bytes(32), rand_bytes(n)
+        add(key, msg, Poly1305.generate_tag(key, msg))
+    # r and s all ones: the widest intermediate values
+    ones = bytes([0xff] * 32)
+    for n in [16, 64, 1000]:
+        msg = bytes([0xff] * n)
+        add(ones, msg, Poly1305.generate_tag(ones, msg))
+    return "\n".join(lines) + "\n"
+
+
+def aead_vectors():
+    lines = ["# key nonce aad plaintext sealed (the ciphertext, then the 16-byte tag;",
+             "# RFC 8439 2.8.2 and A.5, then random)"]
+
+    def add(key, nonce, aad, pt, sealed):
+        assert ChaCha20Poly1305(key).encrypt(nonce, pt, aad) == sealed
+        lines.append("%s %s %s %s %s" % (hx(key), hx(nonce), hx(aad), hx(pt), hx(sealed)))
+
+    # 2.8.2 prints the tag apart; the ciphertext must match
+    key = rfc8439("2.8.2", "", "Key")
+    # the nonce: the 32-bit common part, then the 64-bit IV
+    nonce = rfc8439("2.8.2", "", "32-bit fixed-common part") + rfc8439("2.8.2", "", "IV")
+    assert chacha20(key, 0, nonce, bytes(32)) == rfc8439("2.8.2", "", "Poly1305 Key")
+    aad = rfc8439("2.8.2", "", "AAD")
+    pt = rfc8439("2.8.2", "", "Plaintext")
+    sealed = ChaCha20Poly1305(key).encrypt(nonce, pt, aad)
+    assert sealed[:-16] == rfc8439("2.8.2", "", "Ciphertext")
+    add(key, nonce, aad, pt, sealed)
+    # A.5: a message received, with its tag
+    key = rfc8439("A.5", "", "The ChaCha20 Key")
+    nonce = rfc8439("A.5", "", "The nonce")
+    aad = rfc8439("A.5", "", "The AAD")
+    ct = rfc8439("A.5", "", "Ciphertext")
+    tag = rfc8439("A.5", "", "Received Tag")
+    assert tag == rfc8439("A.5", "", "Calculated Tag")
+    pt = ChaCha20Poly1305(key).decrypt(nonce, ct + tag, aad)
+    assert pt == rfc8439("A.5", "", "Plaintext")
+    add(key, nonce, aad, pt, ct + tag)
+    for i in range(40):
+        key, nonce = rand_bytes(32), rand_bytes(12)
+        aad = rand_bytes(RNG.choice([0, 1, 12, 16, 17, 64]))
+        pt = rand_bytes(RNG.choice([0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 1000]))
+        add(key, nonce, aad, pt, ChaCha20Poly1305(key).encrypt(nonce, pt, aad))
+    return "\n".join(lines) + "\n"
+
+
 # ------------------------------------------------------------------ main
 
 OUTPUTS = {
@@ -462,6 +637,10 @@ OUTPUTS = {
     "tests/vectors/hkdf.txt": hkdf_vectors,
     "tests/vectors/hkdf_label.txt": hkdf_label_vectors,
     "tests/vectors/ed25519.txt": ed25519_vectors,
+    "tests/vectors/x25519.txt": x25519_vectors,
+    "tests/vectors/chacha20.txt": chacha20_vectors,
+    "tests/vectors/poly1305.txt": poly1305_vectors,
+    "tests/vectors/chacha20poly1305.txt": aead_vectors,
 }
 
 

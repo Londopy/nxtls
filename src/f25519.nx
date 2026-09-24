@@ -1,0 +1,243 @@
+// f25519.nx: arithmetic modulo p = 2^255 - 19, the field under Ed25519
+// (ed25519.nx) and X25519 (x25519.nx).
+//
+// Field elements are five 51-bit limbs in u64 with u128 products, the
+// representation of curve25519-donna and most 64-bit implementations,
+// least significant limb first. Arithmetic is checked: a limb that outgrew
+// its bounds would panic rather than wrap into a wrong answer.
+//
+// Every operation here runs the same instructions whatever the values:
+// no branch and no table index depends on a field element, so X25519 can
+// use them on secrets. `pow` branches on its exponent, which is always a
+// public constant here, and `cswap` is the constant-time swap the X25519
+// ladder needs. (`is_canonical` and friends read public encodings only.)
+
+import tables
+
+/// A field element: five 51-bit limbs, least significant first. Between
+/// operations limb 0 may carry a few bits more than 51.
+pub type Fe = [5]u64
+
+pub const MASK: u64 = 0x7ffffffffffff
+
+pub fn small(v: u64) -> Fe {
+    return [v, 0, 0, 0, 0]
+}
+
+/// Every limb back under 2^51 (limb 0 under 2^51 + 2^18), so the next add
+/// or multiply stays within its bounds.
+pub fn carry(a: Fe) -> Fe {
+    var t = a
+    t[1] += t[0] >> 51
+    t[0] &= MASK
+    t[2] += t[1] >> 51
+    t[1] &= MASK
+    t[3] += t[2] >> 51
+    t[2] &= MASK
+    t[4] += t[3] >> 51
+    t[3] &= MASK
+    t[0] += (t[4] >> 51) * 19
+    t[4] &= MASK
+    return t
+}
+
+pub fn add(a: Fe, b: Fe) -> Fe {
+    return carry([a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]])
+}
+
+/// a - b with 4p added first, so no limb goes below zero while b's limbs
+/// are under 2^53.
+pub fn sub(a: Fe, b: Fe) -> Fe {
+    return carry([
+        (a[0] + 0x1fffffffffffb4) - b[0],
+        (a[1] + 0x1ffffffffffffc) - b[1],
+        (a[2] + 0x1ffffffffffffc) - b[2],
+        (a[3] + 0x1ffffffffffffc) - b[3],
+        (a[4] + 0x1ffffffffffffc) - b[4],
+    ])
+}
+
+pub fn neg(a: Fe) -> Fe {
+    return sub(small(0), a)
+}
+
+/// Schoolbook product with the reduction 2^255 = 19 folded in: limbs under
+/// 2^52 give products under 2^109 and column sums under 2^112.
+pub fn mul(a: Fe, b: Fe) -> Fe {
+    let a0 = a[0] as u128
+    let a1 = a[1] as u128
+    let a2 = a[2] as u128
+    let a3 = a[3] as u128
+    let a4 = a[4] as u128
+    let b0 = b[0] as u128
+    let b1 = b[1] as u128
+    let b2 = b[2] as u128
+    let b3 = b[3] as u128
+    let b4 = b[4] as u128
+    let b1_19 = b1 * 19
+    let b2_19 = b2 * 19
+    let b3_19 = b3 * 19
+    let b4_19 = b4 * 19
+    let r0 = a0 * b0 + a1 * b4_19 + a2 * b3_19 + a3 * b2_19 + a4 * b1_19
+    var r1 = a0 * b1 + a1 * b0 + a2 * b4_19 + a3 * b3_19 + a4 * b2_19
+    var r2 = a0 * b2 + a1 * b1 + a2 * b0 + a3 * b4_19 + a4 * b3_19
+    var r3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + a4 * b4_19
+    var r4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0
+    let m = MASK as u128
+    r1 += r0 >> 51
+    r2 += r1 >> 51
+    r3 += r2 >> 51
+    r4 += r3 >> 51
+    let s0 = (r0 & m) + (r4 >> 51) * 19
+    return [
+        (s0 & m) as u64,
+        ((r1 & m) + (s0 >> 51)) as u64,
+        (r2 & m) as u64,
+        (r3 & m) as u64,
+        (r4 & m) as u64,
+    ]
+}
+
+/// a^e for a 32-byte little-endian exponent, square and multiply from the
+/// top bit; exponents here are public constants.
+pub fn pow(a: Fe, e: []u8) -> Fe {
+    var r = small(1)
+    var i: usize = 256
+    while i > 0 {
+        i -= 1
+        r = mul(r, r)
+        if ((e[i / 8] >> @truncate(u8, i % 8)) & 1) == 1 {
+            r = mul(r, a)
+        }
+    }
+    return r
+}
+
+/// 1/a, as a^(p-2); 0 for 0.
+pub fn invert(a: Fe) -> Fe {
+    return pow(a, tables.ED_P_MINUS_2[..])
+}
+
+/// Swaps `a` and `b` when `swap` is 1 and leaves them when it is 0, doing
+/// the same work either way.
+pub fn cswap(a: *mut Fe, b: *mut Fe, swap: u64) {
+    let mask = (0 as u64) -% swap
+    for i in 0..5 {
+        let x = mask & (a[i] ^ b[i])
+        a[i] ^= x
+        b[i] ^= x
+    }
+}
+
+pub fn load64(b: []u8, at: usize) -> u64 {
+    var v: u64 = 0
+    for k in 0..8 {
+        v |= (b[at + k] as u64) << ((8 * k) as u64)
+    }
+    return v
+}
+
+pub fn store64(out: *mut [32]u8, at: usize, v: u64) {
+    for k in 0..8 {
+        out[at + k] = @truncate(u8, v >> ((8 * k) as u64))
+    }
+}
+
+/// The canonical encoding: fully reduced into [0, p), 32 bytes
+/// little-endian.
+pub fn to_bytes(a: Fe) -> [32]u8 {
+    var t = carry(carry(a))
+    // t < 2^255 + 19 now; q is 1 exactly when t >= p, that is when
+    // t + 19 carries out of bit 255
+    var q = (t[0] + 19) >> 51
+    q = (t[1] + q) >> 51
+    q = (t[2] + q) >> 51
+    q = (t[3] + q) >> 51
+    q = (t[4] + q) >> 51
+    t[0] += 19 * q
+    t[1] += t[0] >> 51
+    t[0] &= MASK
+    t[2] += t[1] >> 51
+    t[1] &= MASK
+    t[3] += t[2] >> 51
+    t[2] &= MASK
+    t[4] += t[3] >> 51
+    t[3] &= MASK
+    t[4] &= MASK
+    var out: [32]u8 = undefined
+    store64(&mut out, 0, t[0] | (t[1] << 51))
+    store64(&mut out, 8, (t[1] >> 13) | (t[2] << 38))
+    store64(&mut out, 16, (t[2] >> 26) | (t[3] << 25))
+    store64(&mut out, 24, (t[3] >> 39) | (t[4] << 12))
+    return out
+}
+
+/// The 255 low bits of 32 little-endian bytes; bit 255 is the caller's.
+pub fn from_bytes(b: []u8) -> Fe {
+    let w0 = load64(b, 0)
+    let w1 = load64(b, 8)
+    let w2 = load64(b, 16)
+    let w3 = load64(b, 24)
+    return [
+        w0 & MASK,
+        ((w0 >> 51) | (w1 << 13)) & MASK,
+        ((w1 >> 38) | (w2 << 26)) & MASK,
+        ((w2 >> 25) | (w3 << 39)) & MASK,
+        (w3 >> 12) & MASK,
+    ]
+}
+
+/// Whether the 255 low bits of `b` are below p: at or above it means every
+/// limb but the lowest is all ones and the lowest is at least 2^51 - 19.
+pub fn is_canonical(b: []u8) -> bool {
+    let f = from_bytes(b)
+    let high_ones = f[1] == MASK and f[2] == MASK and f[3] == MASK and f[4] == MASK
+    return !(high_ones and f[0] >= MASK - 18)
+}
+
+pub fn is_zero(a: Fe) -> bool {
+    var acc: u8 = 0
+    for x in to_bytes(a) {
+        acc |= x
+    }
+    return acc == 0
+}
+
+/// RFC 8032's sign of x: the low bit of its canonical value.
+pub fn is_odd(a: Fe) -> bool {
+    return (to_bytes(a)[0] & 1) == 1
+}
+
+pub fn eq(a: Fe, b: Fe) -> bool {
+    return is_zero(sub(a, b))
+}
+
+// ------------------------------------------------------------------ tests
+
+test "the field: a round trip, an inverse, and the conditional swap" {
+    // 2^255 - 20 = -1 mod p: canonical, and (-1)^2 = 1
+    var m1: [32]u8 = undefined
+    m1[0] = 0xec
+    for i in 1..31 {
+        m1[i] = 0xff
+    }
+    m1[31] = 0x7f
+    let x = from_bytes(m1[..])
+    expect(is_canonical(m1[..]))
+    expect_eq(to_bytes(x)[0], 0xec)
+    expect(eq(mul(x, x), small(1)))
+    expect(eq(neg(x), small(1)))
+    // 7 * 7^-1 = 1
+    expect(eq(mul(small(7), invert(small(7))), small(1)))
+    // p itself is not canonical, and reduces to 0
+    var p = m1
+    p[0] = 0xed
+    expect(!is_canonical(p[..]))
+    expect(is_zero(from_bytes(p[..])))
+    var a = small(3)
+    var b = small(5)
+    cswap(&mut a, &mut b, 0)
+    expect(eq(a, small(3)))
+    cswap(&mut a, &mut b, 1)
+    expect(eq(a, small(5)) and eq(b, small(3)))
+}

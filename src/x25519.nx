@@ -1,0 +1,193 @@
+// x25519.nx: X25519 key agreement (RFC 7748), the key exchange of TLS 1.3.
+//
+// `import nxtls.x25519` then:
+//
+//     let mine = x25519.public_key(secret)          // secret: 32 random bytes
+//     let shared = try x25519.shared(secret, theirs) // theirs: the peer's key
+//
+// The secret scalar is handled in constant time: the Montgomery ladder
+// runs all 255 steps whatever the bits, and swaps its two points with
+// f25519.cswap (masks, never a branch). The field arithmetic is
+// f25519.nx's, shared with Ed25519.
+//
+// As RFC 7748 asks, the peer's u-coordinate has its top bit ignored and
+// non-canonical values are reduced, not refused. A shared secret of all
+// zeros (the peer sent a point of small order) is an error: TLS 1.3 must
+// abort then (RFC 8446 7.4.2), and so must anyone else.
+
+import f25519
+
+// (486662 - 2) / 4, the curve's constant in the ladder
+const A24: u64 = 121665
+
+/// The u-coordinate of the base point, 9.
+pub const BASE: [32]u8 = [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+/// X25519(k, u): the scalar `k` (32 bytes, clamped here as RFC 7748 says)
+/// times the point with u-coordinate `u` (32 bytes).
+pub fn scalar_mult(k: []u8, u: []u8) -> [32]u8 {
+    var e: [32]u8 = undefined
+    for i in 0..32 {
+        e[i] = k[i]
+    }
+    e[0] &= 248
+    e[31] &= 127
+    e[31] |= 64
+    // the 255 low bits: bit 255 of u is ignored
+    let x1 = f25519.from_bytes(u)
+    var x2 = f25519.small(1)
+    var z2 = f25519.small(0)
+    var x3 = x1
+    var z3 = f25519.small(1)
+    var swap: u64 = 0
+    let a24 = f25519.small(A24)
+    var t: usize = 255
+    while t > 0 {
+        t -= 1
+        let bit = ((e[t / 8] >> @truncate(u8, t % 8)) & 1) as u64
+        swap ^= bit
+        f25519.cswap(&mut x2, &mut x3, swap)
+        f25519.cswap(&mut z2, &mut z3, swap)
+        swap = bit
+        let a = f25519.add(x2, z2)
+        let aa = f25519.mul(a, a)
+        let b = f25519.sub(x2, z2)
+        let bb = f25519.mul(b, b)
+        let ee = f25519.sub(aa, bb)
+        let c = f25519.add(x3, z3)
+        let d = f25519.sub(x3, z3)
+        let da = f25519.mul(d, a)
+        let cb = f25519.mul(c, b)
+        let sum = f25519.add(da, cb)
+        x3 = f25519.mul(sum, sum)
+        let diff = f25519.sub(da, cb)
+        z3 = f25519.mul(x1, f25519.mul(diff, diff))
+        x2 = f25519.mul(aa, bb)
+        z2 = f25519.mul(ee, f25519.add(aa, f25519.mul(a24, ee)))
+    }
+    f25519.cswap(&mut x2, &mut x3, swap)
+    f25519.cswap(&mut z2, &mut z3, swap)
+    return f25519.to_bytes(f25519.mul(x2, f25519.invert(z2)))
+}
+
+/// The public key of the 32-byte secret `k`.
+pub fn public_key(k: []u8) -> [32]u8 {
+    return scalar_mult(k, BASE[..])
+}
+
+/// The secret `k` and the peer's public key agree on this; `error.SmallOrder`
+/// when it comes out all zeros (the peer's key was a point of small order),
+/// which TLS 1.3 must treat as fatal.
+pub fn shared(k: []u8, their_public: []u8) -> ![32]u8 {
+    if k.len != 32 or their_public.len != 32 {
+        return error.InvalidInput
+    }
+    let s = scalar_mult(k, their_public)
+    var acc: u8 = 0
+    for b in s {
+        acc |= b
+    }
+    if acc == 0 {
+        return error.SmallOrder
+    }
+    return s
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.bytes
+import std.fs
+import testvec
+
+fn hex(b: [32]u8) -> String {
+    return bytes.hex(b[..])
+}
+
+test "RFC 7748 5.2: two scalar multiplications" {
+    let k1 = testvec.unhex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
+    let u1 = testvec.unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
+    expect_eq(hex(scalar_mult(k1, u1)), "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+    let k2 = testvec.unhex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d")
+    let u2 = testvec.unhex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493")
+    expect_eq(hex(scalar_mult(k2, u2)), "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
+}
+
+test "RFC 7748 5.2: the iterated test, 1 and 1000 times" {
+    var k = String.from(BASE[..])
+    var u = String.from(BASE[..])
+    for i in 0..1000 {
+        let r = scalar_mult(k, u)
+        u = k
+        k = String.from(r[..])
+        if i == 0 {
+            expect_eq(bytes.hex(k), "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079")
+        }
+    }
+    expect_eq(bytes.hex(k), "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51")
+}
+
+test "RFC 7748 6.1: Alice and Bob agree" {
+    let a = testvec.unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    let b = testvec.unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    let pa = public_key(a)
+    let pb = public_key(b)
+    expect_eq(hex(pa), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    expect_eq(hex(pb), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    let s1 = shared(a, pb[..]) catch {
+        panic("shared")
+    }
+    let s2 = shared(b, pa[..]) catch {
+        panic("shared")
+    }
+    expect_eq(hex(s1), "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    expect_eq(hex(s2), hex(s1))
+}
+
+// the name of the error `shared` gives, or "" when it gives a secret
+fn refusal(k: []u8, u: []u8) -> String {
+    _ = shared(k, u) catch |e| {
+        return String.from(@errorName(e))
+    }
+    return String.new()
+}
+
+test "a peer key of small order is refused, and the top bit of u is ignored" {
+    let k = testvec.unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    // 0 and 1 are of small order: the shared secret is all zeros
+    var zero: [32]u8 = undefined
+    for i in 0..32 {
+        zero[i] = 0
+    }
+    expect_eq(refusal(k, zero[..]), "SmallOrder")
+    var one = zero
+    one[0] = 1
+    expect_eq(refusal(k, one[..]), "SmallOrder")
+    expect_eq(refusal(k[0..31], one[..]), "InvalidInput")
+    expect_eq(refusal(k, BASE[..]), "")
+    // u with bit 255 set is the same point
+    let u = testvec.unhex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
+    var high: [32]u8 = undefined
+    for i in 0..32 {
+        high[i] = u[i]
+    }
+    high[31] |= 0x80
+    expect_eq(hex(scalar_mult(k, high[..])), hex(scalar_mult(k, u)))
+}
+
+test "the vectors from Python's cryptography package" {
+    let text = fs.read("tests/vectors/x25519.txt") catch {
+        panic("tests/vectors/x25519.txt")
+    }
+    var n = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let k = testvec.unhex(f[0])
+        let u = testvec.unhex(f[1])
+        expect_eq(hex(scalar_mult(k, u)), f[2])
+        n += 1
+    }
+    expect(n >= 100)
+}

@@ -45,11 +45,13 @@ jobs:
           nx test src/hkdf.nx
           nx test src/ed25519.nx
           nx test src/sha1.nx
+          nx test src/x25519.nx
+          nx test src/chacha20poly1305.nx
 
       - name: No unsafe blocks, no mutable globals, no ffi
         if: runner.os == 'Linux'
         run: |
-          for m in sha2 sha1 hmac hkdf ed25519 ct; do
+          for m in sha2 sha1 hmac hkdf f25519 ed25519 x25519 chacha20poly1305 ct; do
             nx audit src/$m.nx | tee audit.txt
             grep -q "unsafe blocks: 0" audit.txt
             grep -q "mutable globals: 0" audit.txt

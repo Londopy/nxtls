@@ -40,6 +40,9 @@ radio club, which checks every request's Ed25519 signature with it.
 | `hmac` | HMAC over each of them, constant-time `verify` | RFC 4231, keys either side of the block size |
 | `hkdf` | HKDF extract and expand, TLS 1.3 `expand_label` and `derive_secret` | RFC 5869, RFC 8448's early and derived secrets |
 | `ed25519` | signature verification (verify only) | RFC 8032, random keys, tampering, S + L, non-canonical and small-order inputs |
+| `x25519` | X25519 key agreement, constant time; refuses an all-zero shared secret | RFC 7748 (the iterated test to 1000, Alice and Bob), random keys, points on the twist, u with bit 255 set, small-order points |
+| `chacha20poly1305` | ChaCha20, Poly1305 and their AEAD, constant time | RFC 8439 (every vector of its appendix, among them the Poly1305 carry and reduction cases), random lengths and counters, tampering |
+| `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
 | `ct` | constant-time comparison | every byte value |
 
 `ed25519.verify` is stricter than RFC 8032 in the ways libsodium is: it
@@ -51,7 +54,7 @@ cases where that differs from a permissive verifier such as OpenSSL's.
 
 ```toml
 [dependencies]
-nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.2.0" }
+nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.3.0" }
 ```
 
 ```nexium
@@ -72,6 +75,8 @@ if !ed25519.verify(public_key, message, signature) { ... }
 nx test src/hkdf.nx                    # also runs the tests of what it imports
 nx test src/ed25519.nx
 nx test src/sha1.nx
+nx test src/x25519.nx
+nx test src/chacha20poly1305.nx
 python tools/gen.py --check            # the vectors and tables are current
 ```
 
@@ -91,7 +96,7 @@ The order lets each piece be tested alone:
 
 1. ~~SHA-2, HMAC and HKDF~~ (and SHA-1, for WebSocket)
 2. ~~Ed25519 verification~~
-3. ChaCha20-Poly1305 and X25519
+3. ~~ChaCha20-Poly1305 and X25519~~
 4. DER, PEM, X.509, RSA and ECDSA verification
 5. The record layer and the TLS 1.3 handshake: replayed against RFC 8448
    byte for byte, then live hosts, with badssl.com's broken hosts as

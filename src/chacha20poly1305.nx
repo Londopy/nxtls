@@ -1,0 +1,394 @@
+// chacha20poly1305.nx: ChaCha20, Poly1305 and their AEAD (RFC 8439), the
+// cipher of TLS 1.3's TLS_CHACHA20_POLY1305_SHA256.
+//
+// `import nxtls.chacha20poly1305` then:
+//
+//     let sealed = try chacha20poly1305.seal(key, nonce, aad, plaintext)
+//     let plain = chacha20poly1305.open(key, nonce, aad, sealed) orelse ...
+//
+// The key is 32 bytes and the nonce 12; a nonce must never be used twice
+// with the same key. `seal` gives the ciphertext followed by the 16-byte
+// tag, and `open` takes the same and gives null when anything was changed.
+//
+// Constant time throughout: ChaCha20 is additions, xors and rotations of
+// 32-bit words; Poly1305 works in five 26-bit limbs (poly1305-donna's
+// layout, with 64-bit products) and chooses between h and h - p with masks
+// in wrapping arithmetic; `open` compares the tag with ct.eq and decrypts
+// nothing until it matches.
+
+import ct
+
+const SIGMA: [4]u32 = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]
+
+fn rotl32(x: u32, n: u32) -> u32 {
+    return (x << n) | (x >> (32 - n))
+}
+
+fn le32(b: []u8, at: usize) -> u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24)
+}
+
+// ------------------------------------------------------------------ ChaCha20
+
+fn quarter(s: *mut [16]u32, a: usize, b: usize, c: usize, d: usize) {
+    s[a] = s[a] +% s[b]
+    s[d] = rotl32(s[d] ^ s[a], 16)
+    s[c] = s[c] +% s[d]
+    s[b] = rotl32(s[b] ^ s[c], 12)
+    s[a] = s[a] +% s[b]
+    s[d] = rotl32(s[d] ^ s[a], 8)
+    s[c] = s[c] +% s[d]
+    s[b] = rotl32(s[b] ^ s[c], 7)
+}
+
+/// The ChaCha20 block function (RFC 8439 2.3): 64 bytes of key stream for
+/// the 32-byte key, the block `counter` and the 12-byte nonce.
+pub fn block(key: []u8, counter: u32, nonce: []u8) -> [64]u8 {
+    var init: [16]u32 = undefined
+    for i in 0..4 {
+        init[i] = SIGMA[i]
+    }
+    for i in 0..8 {
+        init[4 + i] = le32(key, 4 * i)
+    }
+    init[12] = counter
+    for i in 0..3 {
+        init[13 + i] = le32(nonce, 4 * i)
+    }
+    var s = init
+    for _ in 0..10 {
+        quarter(&mut s, 0, 4, 8, 12)
+        quarter(&mut s, 1, 5, 9, 13)
+        quarter(&mut s, 2, 6, 10, 14)
+        quarter(&mut s, 3, 7, 11, 15)
+        quarter(&mut s, 0, 5, 10, 15)
+        quarter(&mut s, 1, 6, 11, 12)
+        quarter(&mut s, 2, 7, 8, 13)
+        quarter(&mut s, 3, 4, 9, 14)
+    }
+    var out: [64]u8 = undefined
+    for i in 0..16 {
+        let w = s[i] +% init[i]
+        out[4 * i] = @truncate(u8, w)
+        out[4 * i + 1] = @truncate(u8, w >> 8)
+        out[4 * i + 2] = @truncate(u8, w >> 16)
+        out[4 * i + 3] = @truncate(u8, w >> 24)
+    }
+    return out
+}
+
+/// `data` xored with the key stream from block `counter` on (RFC 8439
+/// 2.4): encryption and decryption alike.
+pub fn xor(key: []u8, counter: u32, nonce: []u8, data: []u8) -> String {
+    var out = String.with_capacity(data.len)
+    var at: usize = 0
+    var n = counter
+    while at < data.len {
+        let ks = block(key, n, nonce)
+        let left = data.len - at
+        let take: usize = if left < 64 { left } else { 64 }
+        for i in 0..take {
+            out.push_byte(data[at + i] ^ ks[i])
+        }
+        at += take
+        n = n +% 1
+    }
+    return out
+}
+
+// ------------------------------------------------------------------ Poly1305
+
+/// Poly1305 (RFC 8439 2.5): the 16-byte tag of `msg` under the one-time
+/// 32-byte key (r, then s). A key must tag one message only.
+pub fn poly1305(key: []u8, msg: []u8) -> [16]u8 {
+    // r, clamped, in five 26-bit limbs; s_i = 5 r_i folds 2^130 = 5 in
+    let r0 = (le32(key, 0) & 0x3ffffff) as u64
+    let r1 = ((le32(key, 3) >> 2) & 0x3ffff03) as u64
+    let r2 = ((le32(key, 6) >> 4) & 0x3ffc0ff) as u64
+    let r3 = ((le32(key, 9) >> 6) & 0x3f03fff) as u64
+    let r4 = ((le32(key, 12) >> 8) & 0x00fffff) as u64
+    let s1 = r1 * 5
+    let s2 = r2 * 5
+    let s3 = r3 * 5
+    let s4 = r4 * 5
+    var h0: u64 = 0
+    var h1: u64 = 0
+    var h2: u64 = 0
+    var h3: u64 = 0
+    var h4: u64 = 0
+    var at: usize = 0
+    while at < msg.len {
+        // a block of 16, or the last one padded with 1 then zeros; a full
+        // block has its 1 at bit 128 (2^24 in the top limb)
+        var m: [16]u8 = undefined
+        var hibit: u64 = 1 << 24
+        let left = msg.len - at
+        let take: usize = if left < 16 { left } else { 16 }
+        for i in 0..16 {
+            m[i] = if i < take { msg[at + i] } else { 0 }
+        }
+        if take < 16 {
+            m[take] = 1
+            hibit = 0
+        }
+        at += take
+        h0 += (le32(m[..], 0) & 0x3ffffff) as u64
+        h1 += ((le32(m[..], 3) >> 2) & 0x3ffffff) as u64
+        h2 += ((le32(m[..], 6) >> 4) & 0x3ffffff) as u64
+        h3 += ((le32(m[..], 9) >> 6) & 0x3ffffff) as u64
+        h4 += ((le32(m[..], 12) >> 8) as u64) | hibit
+        // h *= r, mod 2^130 - 5 (partly)
+        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        var d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        var d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        var d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        var d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+        var c = d0 >> 26
+        h0 = d0 & 0x3ffffff
+        d1 += c
+        c = d1 >> 26
+        h1 = d1 & 0x3ffffff
+        d2 += c
+        c = d2 >> 26
+        h2 = d2 & 0x3ffffff
+        d3 += c
+        c = d3 >> 26
+        h3 = d3 & 0x3ffffff
+        d4 += c
+        c = d4 >> 26
+        h4 = d4 & 0x3ffffff
+        h0 += c * 5
+        c = h0 >> 26
+        h0 &= 0x3ffffff
+        h1 += c
+    }
+    // carry h fully
+    var c = h1 >> 26
+    h1 &= 0x3ffffff
+    h2 += c
+    c = h2 >> 26
+    h2 &= 0x3ffffff
+    h3 += c
+    c = h3 >> 26
+    h3 &= 0x3ffffff
+    h4 += c
+    c = h4 >> 26
+    h4 &= 0x3ffffff
+    h0 += c * 5
+    c = h0 >> 26
+    h0 &= 0x3ffffff
+    h1 += c
+    // g = h - p = h + 5 - 2^130; keep g when that did not go below zero
+    var g0 = h0 + 5
+    c = g0 >> 26
+    g0 &= 0x3ffffff
+    var g1 = h1 + c
+    c = g1 >> 26
+    g1 &= 0x3ffffff
+    var g2 = h2 + c
+    c = g2 >> 26
+    g2 &= 0x3ffffff
+    var g3 = h3 + c
+    c = g3 >> 26
+    g3 &= 0x3ffffff
+    var g4 = (h4 + c) -% (1 << 26)
+    // all ones when g4 did not wrap (h >= p), zero when it did
+    let keep_g = (g4 >> 63) -% 1
+    let keep_h = ~keep_g
+    h0 = (h0 & keep_h) | (g0 & keep_g)
+    h1 = (h1 & keep_h) | (g1 & keep_g)
+    h2 = (h2 & keep_h) | (g2 & keep_g)
+    h3 = (h3 & keep_h) | (g3 & keep_g)
+    h4 = (h4 & keep_h) | (g4 & keep_g)
+    // h mod 2^128, as four 32-bit words, plus s
+    let w0 = (h0 | (h1 << 26)) & 0xffffffff
+    let w1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff
+    let w2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff
+    let w3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff
+    var f = w0 + (le32(key, 16) as u64)
+    var out: [16]u8 = undefined
+    put32(&mut out, 0, f)
+    f = w1 + (le32(key, 20) as u64) + (f >> 32)
+    put32(&mut out, 4, f)
+    f = w2 + (le32(key, 24) as u64) + (f >> 32)
+    put32(&mut out, 8, f)
+    f = w3 + (le32(key, 28) as u64) + (f >> 32)
+    put32(&mut out, 12, f)
+    return out
+}
+
+fn put32(out: *mut [16]u8, at: usize, v: u64) {
+    out[at] = @truncate(u8, v)
+    out[at + 1] = @truncate(u8, v >> 8)
+    out[at + 2] = @truncate(u8, v >> 16)
+    out[at + 3] = @truncate(u8, v >> 24)
+}
+
+// ------------------------------------------------------------------ the AEAD
+
+fn zeros(out: *mut String, n: usize) {
+    for _ in 0..n {
+        out.push_byte(0)
+    }
+}
+
+fn le64(out: *mut String, v: usize) {
+    let x = v as u64
+    for k in 0..8 {
+        out.push_byte(@truncate(u8, x >> ((8 * k) as u64)))
+    }
+}
+
+// the tag over the aad and the ciphertext (RFC 8439 2.8), keyed with the
+// first 32 bytes of block 0
+fn tag_of(key: []u8, nonce: []u8, aad: []u8, ciphertext: []u8) -> [16]u8 {
+    let otk = block(key, 0, nonce)
+    var m = String.with_capacity(aad.len + ciphertext.len + 48)
+    m.append(aad)
+    zeros(&mut m, (16 - aad.len % 16) % 16)
+    m.append(ciphertext)
+    zeros(&mut m, (16 - ciphertext.len % 16) % 16)
+    le64(&mut m, aad.len)
+    le64(&mut m, ciphertext.len)
+    return poly1305(otk[0..32], m)
+}
+
+/// AEAD_CHACHA20_POLY1305 (RFC 8439 2.8): `plaintext` encrypted under the
+/// 32-byte key and 12-byte nonce, with `aad` authenticated alongside; the
+/// ciphertext, then the 16-byte tag. `error.InvalidInput` for a key or
+/// nonce of the wrong length.
+pub fn seal(key: []u8, nonce: []u8, aad: []u8, plaintext: []u8) -> !String {
+    if key.len != 32 or nonce.len != 12 {
+        return error.InvalidInput
+    }
+    var out = xor(key, 1, nonce, plaintext)
+    let tag = tag_of(key, nonce, aad, out)
+    out.append(tag[..])
+    return out
+}
+
+/// The plaintext of `sealed` (the ciphertext, then its tag), or null when
+/// the tag does not match: the message was changed, or the key, nonce or
+/// aad are not the ones it was sealed with.
+pub fn open(key: []u8, nonce: []u8, aad: []u8, sealed: []u8) -> ?String {
+    if key.len != 32 or nonce.len != 12 or sealed.len < 16 {
+        return null
+    }
+    let body = sealed[0..sealed.len - 16]
+    let tag = tag_of(key, nonce, aad, body)
+    if !ct.eq(tag[..], sealed[sealed.len - 16..sealed.len]) {
+        return null
+    }
+    return xor(key, 1, nonce, body)
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.bytes
+import std.fs
+import testvec
+
+test "RFC 8439 2.1.1: the quarter round" {
+    var s: [16]u32 = undefined
+    for i in 0..16 {
+        s[i] = 0
+    }
+    s[0] = 0x11111111
+    s[1] = 0x01020304
+    s[2] = 0x9b8d6f43
+    s[3] = 0x01234567
+    quarter(&mut s, 0, 1, 2, 3)
+    expect(s[0] == 0xea2a92f4 and s[1] == 0xcb1cf8ce and s[2] == 0x4581472e and s[3] == 0x5881c4bb)
+}
+
+test "ChaCha20: RFC 8439 A.1, A.2 and A.4, and random lengths and counters" {
+    let text = fs.read("tests/vectors/chacha20.txt") catch {
+        panic("tests/vectors/chacha20.txt")
+    }
+    var n = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let counter = f[1].parse_int(u32) catch {
+            panic("counter")
+        }
+        let out = xor(testvec.unhex(f[0]), counter, testvec.unhex(f[2]), testvec.unhex(f[3]))
+        let want = if f[4] == "-" { "" } else { f[4][..] }
+        expect_eq(bytes.hex(out), want)
+        n += 1
+    }
+    expect(n >= 40)
+}
+
+test "Poly1305: RFC 8439 A.3, the carries and the final reduction, and random" {
+    let text = fs.read("tests/vectors/poly1305.txt") catch {
+        panic("tests/vectors/poly1305.txt")
+    }
+    var n = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let tag = poly1305(testvec.unhex(f[0]), testvec.unhex(f[1]))
+        expect_eq(bytes.hex(tag[..]), f[2])
+        n += 1
+    }
+    expect(n >= 50)
+}
+
+test "the AEAD: RFC 8439 2.8.2 and A.5, random, and every kind of tampering refused" {
+    let text = fs.read("tests/vectors/chacha20poly1305.txt") catch {
+        panic("tests/vectors/chacha20poly1305.txt")
+    }
+    var n = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        let key = testvec.unhex(f[0])
+        let nonce = testvec.unhex(f[1])
+        let aad = testvec.unhex(f[2])
+        let pt = testvec.unhex(f[3])
+        let sealed = seal(key, nonce, aad, pt) catch {
+            panic("seal")
+        }
+        expect_eq(bytes.hex(sealed), f[4])
+        let back = open(key, nonce, aad, sealed) orelse {
+            panic("a sealed message did not open")
+        }
+        expect(back == pt)
+        // a flipped bit anywhere, another aad, another nonce: refused
+        let at = (n * 7) % sealed.len
+        var flipped = String.new()
+        for i in 0..sealed.len {
+            flipped.push_byte(if i == at { sealed[i] ^ 1 } else { sealed[i] })
+        }
+        expect(open(key, nonce, aad, flipped) == null)
+        var other_aad = String.from(aad)
+        other_aad.push_byte(0)
+        expect(open(key, nonce, other_aad, sealed) == null)
+        var other_nonce = String.new()
+        for i in 0..11 {
+            other_nonce.push_byte(nonce[i])
+        }
+        other_nonce.push_byte(nonce[11] ^ 0x80)
+        expect(open(key, other_nonce, aad, sealed) == null)
+        n += 1
+    }
+    expect(n >= 40)
+    // too short to hold a tag, and wrong lengths of key and nonce
+    let key = testvec.unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let nonce = testvec.unhex("070000004041424344454647")
+    expect(open(key, nonce, "", "short") == null)
+    expect(open(key[0..31], nonce, "", "0123456789abcdef0123") == null)
+    var refused = false
+    _ = seal(key, nonce[0..8], "", "x") catch {
+        refused = true
+        String.new()
+    }
+    expect(refused)
+}
