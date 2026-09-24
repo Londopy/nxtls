@@ -4,7 +4,7 @@
 
 # nxtls
 
-**Cryptography, and later a TLS 1.3 client, written entirely in Nexium.**<br>
+**Cryptography and a TLS 1.3 client, written entirely in Nexium.**<br>
 No C libraries, no `@cImport`, no `unsafe`: code a reviewer can read end to end.
 
 [![CI](https://github.com/Londopy/nxtls/actions/workflows/ci.yml/badge.svg)](https://github.com/Londopy/nxtls/actions/workflows/ci.yml)
@@ -23,18 +23,21 @@ No C libraries, no `@cImport`, no `unsafe`: code a reviewer can read end to end.
 nxtls exists so that Nexium programs can verify signatures and speak
 HTTPS without handing their security to a C library. The first user is
 [QNI](https://github.com/Londopy/qni), a Discord helper for an amateur
-radio club, which checks every request's Ed25519 signature with it.
+radio club, which checks every request's Ed25519 signature with it and
+talks to Discord through its TLS client.
 
 > [!WARNING]
-> **Early.** What is here is tested against published vectors; the TLS
-> client is not written yet. Do not use nxtls to protect anything that
-> matters until the whole plan below has been reviewed by someone who
-> knows TLS.
+> **New.** The TLS client works against Discord, GitHub, Google,
+> Cloudflare and OpenSSL 3, and replays 35 recorded exchanges byte for
+> byte; everything under it is tested against published vectors and
+> Python's `cryptography`. None of it has been reviewed by someone who
+> knows TLS yet: weigh that before trusting it with anything that matters.
 
 ## Modules
 
 | module | what | tested against |
 | --- | --- | --- |
+| `tls` | a TLS 1.3 client: TLS_CHACHA20_POLY1305_SHA256, X25519, the server's signature by ECDSA P-256/P-384 or RSA-PSS, its chain checked by `x509`; HelloRetryRequest, KeyUpdate, a server asking for a client certificate. `Client` is the protocol alone (bytes in, bytes out); `Conn` runs it over TCP | RFC 8448's key schedule and Finished values; 35 exchanges with a server gen.py plays from Python's `cryptography`, byte for byte (every alert the client sends among them); OpenSSL 3's `s_server` in twelve configurations; live, Discord, callook.info, GitHub, Google and Cloudflare |
 | `sha2` | SHA-256, SHA-384, SHA-512 | FIPS 180-4 messages, every padding boundary, a million a's |
 | `sha1` | SHA-1, and the WebSocket handshake's `Sec-WebSocket-Accept` (never for signatures or integrity: SHA-1 is broken) | FIPS 180-4 messages, every padding boundary, a million a's, RFC 6455's example |
 | `hmac` | HMAC over each of them, constant-time `verify` | RFC 4231, keys either side of the block size |
@@ -45,6 +48,7 @@ radio club, which checks every request's Ed25519 signature with it.
 | `ecdsa` | ECDSA verification on P-256 and P-384, signatures in DER (verify only) | curve checks (G on the curve, n G at infinity), deterministic signatures from Python's cryptography, malleable s, tampering, keys off the curve, r and s out of range, strict DER |
 | `rsa` | RSA verification: PKCS #1 v1.5 (certificates) and PSS (TLS 1.3), keys of 2048 to 8192 bits (verify only) | keys of 2048, 2049, 3072 and 4096 bits made from a seed, signatures checked by Python's cryptography, PSS's emBits edge cases, salt and trailer errors, Bleichenbacher's e = 3 forgery |
 | `x509` | X.509 certificates: reading them, and checking a server's chain against trusted roots for a host name: path building across cross-signed CAs, validity, CA constraints and path lengths, key usage and extended key usage, host names with wildcards | 68 chains and 13 malformed certificates, judged by Python's cryptography's own path validation (marked where nxtls is stricter); the real chains of discord.com, gateway.discord.gg and callook.info; roots that must still load (a zero serial, P-521, SHA-1) |
+| `entropy` | random bytes from the operating system (/dev/urandom, refusing a regular file planted in its place; none on Windows, where it says so) | lengths, repeats, every byte value in 64 KB |
 | `pem` | PEM blocks, as certificate files and CA bundles hold them | text around the blocks, CRLF, broken and unterminated blocks |
 | `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
 | `bn` | big integers with Montgomery multiplication, for verification (public values only) | known products, powers and inverses; through `ecdsa` and `rsa` |
@@ -64,6 +68,21 @@ nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.3.0" }
 ```
 
 ```nexium
+import std.fs
+import nxtls.tls
+import nxtls.x509
+
+let roots = x509.store_from_pem(try fs.read("/etc/ssl/certs/ca-certificates.crt"))
+var conn = tls.connect("discord.com", 443, &roots, time.now(), 10000)
+if !conn.is_open() {
+    println("{}", .{conn.problem})        // why: the certificate, an alert, the network
+}
+try conn.send("GET /api/v10/gateway HTTP/1.1\r\nHost: discord.com\r\nConnection: close\r\n\r\n")
+let answer = try conn.read_all(1 << 20)   // until the server closes
+conn.close()
+```
+
+```nexium
 import nxtls.sha2
 import nxtls.ed25519
 
@@ -73,7 +92,9 @@ if !ed25519.verify(public_key, message, signature) { ... }
 
 `nx fetch` gets it into `nexium_modules/` and pins the commit in
 `nexium.lock`. It needs a 64-bit target: the field arithmetic uses
-128-bit integers.
+128-bit integers. The TLS client needs /dev/urandom (Linux, macOS, the
+BSDs) and a CA bundle; on Windows `tls.connect` says there is no
+randomness rather than use a weaker kind.
 
 ## Tests
 
@@ -87,7 +108,11 @@ nx test src/ecdsa.nx
 nx test src/rsa.nx
 nx test src/pem.nx
 nx test src/x509.nx
+nx test src/entropy.nx
+nx test src/tls.nx
 python tools/gen.py --check            # the vectors and tables are current
+bash tools/interop/run.sh              # against openssl s_server (Linux, macOS)
+nx run tools/interop/live.nx           # against Discord, callook.info and more
 ```
 
 `tools/gen.py` is test tooling only. It derives every constant in
@@ -101,8 +126,13 @@ that they and the tests need.
 
 CI runs the tests on Linux (built against glibc, whose debug build traps
 on undefined behaviour), Windows and macOS. It also checks that no module
-has an `unsafe` block, a mutable global or a foreign call, and that the
-tables and vectors are current.
+has an `unsafe` block, a mutable global or a foreign call, that the tables
+and vectors are current, and that the TLS client does what it must against
+OpenSSL's TLS 1.3 server in each configuration of `tools/interop/run.sh`:
+connecting to P-256, P-384 and RSA servers, through a HelloRetryRequest
+and a request for a client certificate, over small records; refusing a
+server without ChaCha20-Poly1305 or X25519, a certificate for another host
+or one that has expired, and TLS 1.2.
 
 ## Plan
 
@@ -112,10 +142,14 @@ The order lets each piece be tested alone:
 2. ~~Ed25519 verification~~
 3. ~~ChaCha20-Poly1305 and X25519~~
 4. ~~DER, PEM, X.509, RSA and ECDSA verification~~
-5. The record layer and the TLS 1.3 handshake: replayed against RFC 8448
-   byte for byte, then live hosts, with badssl.com's broken hosts as
-   negative tests
-6. Secure randomness (waits on an OS entropy source in Nexium's std)
+5. ~~The record layer and the TLS 1.3 handshake~~: RFC 8448's key
+   schedule, recorded exchanges byte for byte, OpenSSL, live hosts
+6. ~~Secure randomness~~, from /dev/urandom (Nexium's std has no entropy
+   source yet)
+
+Next: a review by someone who knows TLS. AES-GCM, P-256 key exchange and
+resumption wait until a server needs them; every host QNI talks to speaks
+ChaCha20-Poly1305 over X25519.
 
 Code that touches secrets (X25519, HMAC and HKDF over traffic secrets,
 ChaCha20-Poly1305) is written constant time: fixed-length loops, no early

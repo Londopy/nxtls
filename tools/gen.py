@@ -48,6 +48,7 @@ from cryptography.exceptions import InvalidSignature
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from rfc8439 import RFC8439, RFC8439_COUNTERS  # noqa: E402
+from rfc8448 import RFC8448  # noqa: E402
 RNG = random.Random(20260922)
 
 
@@ -1540,6 +1541,484 @@ def x509_vectors():
     return "\n".join(head + cert_lines + info_lines + bad_lines + chain_lines) + "\n"
 
 
+# ------------------------------------------------------------------ TLS 1.3
+
+def tls13_rfc8448_vectors():
+    """RFC 8448's simple handshake, its values checked here by the
+    reference's parts (X25519, hmac, hashlib) before the file is written."""
+    v = {k: bytes.fromhex(h) for k, h in RFC8448.items()}
+    sha = hashlib.sha256
+    assert x25519(v["client_private"], v["server_public"]) == v["shared"]
+    assert X25519PrivateKey.from_private_bytes(v["client_private"]).public_key().public_bytes_raw() == v["client_public"]
+    empty = sha(b"").digest()
+    early = pyhmac.new(b"\x00" * 32, b"\x00" * 32, sha).digest()
+    hs = pyhmac.new(expand_label(sha, early, b"derived", empty, 32), v["shared"], sha).digest()
+    assert hs == v["handshake_secret"]
+    th = sha(v["client_hello"] + v["server_hello"]).digest()
+    assert expand_label(sha, hs, b"c hs traffic", th, 32) == v["c_hs"]
+    assert expand_label(sha, hs, b"s hs traffic", th, 32) == v["s_hs"]
+    master = pyhmac.new(expand_label(sha, hs, b"derived", empty, 32), b"\x00" * 32, sha).digest()
+    assert master == v["master"]
+    t = v["client_hello"] + v["server_hello"] + v["encrypted_extensions"] + v["certificate"] + v["certificate_verify"]
+    fk = expand_label(sha, v["s_hs"], b"finished", b"", 32)
+    assert pyhmac.new(fk, sha(t).digest(), sha).digest() == v["server_finished"][4:]
+    t += v["server_finished"]
+    assert expand_label(sha, master, b"c ap traffic", sha(t).digest(), 32) == v["c_ap"]
+    assert expand_label(sha, master, b"s ap traffic", sha(t).digest(), 32) == v["s_ap"]
+    fk = expand_label(sha, v["c_hs"], b"finished", b"", 32)
+    assert pyhmac.new(fk, sha(t).digest(), sha).digest() == v["client_finished"][4:]
+    lines = ["# RFC 8448 section 3, the simple 1-RTT handshake: name hex"]
+    lines += ["%s %s" % (k, h) for k, h in RFC8448.items()]
+    return "\n".join(lines) + "\n"
+
+
+TLS_SCHEMES = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
+HRR_RANDOM = hashlib.sha256(b"HelloRetryRequest").digest()
+
+
+def u16(v):
+    return v.to_bytes(2, "big")
+
+
+def u24(v):
+    return v.to_bytes(3, "big")
+
+
+def ext_of(kind, data):
+    return u16(kind) + u16(len(data)) + data
+
+
+def hs_msg(kind, body):
+    return bytes([kind]) + u24(len(body)) + body
+
+
+def plain_rec(kind, data, version=0x0303):
+    return bytes([kind]) + u16(version) + u16(len(data)) + data
+
+
+def tls_client_hello(host, random, sid, public, cookie=b""):
+    """The ClientHello nxtls sends (RFC 8446 4.1.2), written out here."""
+    name = host.encode()
+    ext = ext_of(0, u16(len(name) + 3) + b"\x00" + u16(len(name)) + name)
+    ext += ext_of(10, u16(2) + u16(0x001D))
+    ext += ext_of(13, u16(2 * len(TLS_SCHEMES)) + b"".join(u16(x) for x in TLS_SCHEMES))
+    ext += ext_of(43, b"\x02" + u16(0x0304))
+    ext += ext_of(51, u16(len(public) + 4) + u16(0x001D) + u16(len(public)) + public)
+    if cookie:
+        ext += ext_of(44, u16(len(cookie)) + cookie)
+    body = u16(0x0303) + random + bytes([len(sid)]) + sid + u16(2) + u16(0x1303) + b"\x01\x00" + u16(len(ext)) + ext
+    return hs_msg(1, body)
+
+
+def tls_keys(secret):
+    sha = hashlib.sha256
+    return {"secret": secret, "key": expand_label(sha, secret, b"key", b"", 32),
+            "iv": expand_label(sha, secret, b"iv", b"", 12), "seq": 0}
+
+
+def tls_seal(k, kind, data, pad=0):
+    """A protected record (RFC 8446 5.2), by the reference's ChaCha20-Poly1305."""
+    inner = data + bytes([kind]) + b"\x00" * pad
+    header = bytes([23, 3, 3]) + u16(len(inner) + 16)
+    nonce = bytes(a ^ b for a, b in zip(k["iv"], k["seq"].to_bytes(12, "big")))
+    k["seq"] += 1
+    return header + ChaCha20Poly1305(k["key"]).encrypt(nonce, inner, header)
+
+
+def tls_sign(leaf, scheme, content):
+    """CertificateVerify's signature, checked by the reference."""
+    if scheme in (0x0403, 0x0503):
+        fn, halg = (hashlib.sha256, hashes.SHA256()) if scheme == 0x0403 else (hashlib.sha384, hashes.SHA384())
+        digest = fn(content).digest()
+        k = int.from_bytes(rand_bytes(leaf["size"] + 8), "big") % (leaf["c"]["n"] - 1) + 1
+        sig = der_sig(*ec_sign(leaf["curve"], leaf["c"], leaf["size"], leaf["d"], digest, k))
+        assert ref_ecdsa(leaf["curve"], leaf["point"], digest, sig, halg)
+        return sig
+    if scheme in (0x0804, 0x0805, 0x0806):
+        fn, halg = {0x0804: (hashlib.sha256, hashes.SHA256()), 0x0805: (hashlib.sha384, hashes.SHA384()),
+                    0x0806: (hashlib.sha512, hashes.SHA512())}[scheme]
+        digest = fn(content).digest()
+        sig = pss_sign(leaf, fn, digest)
+        assert ref_rsa(leaf["n"], leaf["e"], "pss", halg, digest, sig)
+        return sig
+    assert scheme == 0x0401
+    return rsa_raw(leaf, pkcs1_encode(leaf["k"], "sha256", hashlib.sha256(content).digest()))
+
+
+class TlsScript:
+    """One exchange for tests/vectors/tls13.txt: the server's side played
+    here from the reference's parts (X25519 and ChaCha20-Poly1305 from
+    cryptography, HKDF and HMAC from hashlib and hmac), and the client's
+    side worked out alongside it, so that every byte nxtls must send is
+    known."""
+
+    def __init__(self, out, name, host, now, roots, chain, leaf):
+        self.out = out
+        self.random, self.sid, self.key = rand_bytes(32), rand_bytes(32), rand_bytes(32)
+        self.public = X25519PrivateKey.from_private_bytes(self.key).public_key().public_bytes_raw()
+        self.server_key = rand_bytes(32)
+        self.server_public = X25519PrivateKey.from_private_bytes(self.server_key).public_key().public_bytes_raw()
+        self.host, self.chain, self.leaf = host, chain, leaf
+        out.append("exchange " + name)
+        out.append("client %s %s %s %s" % (host, self.random.hex(), self.sid.hex(), self.key.hex()))
+        out.append("now %d" % ms_of(now))
+        for r in roots:
+            out.append("root " + r.hex())
+        self.ch = tls_client_hello(host, self.random, self.sid, self.public)
+        self.transcript = self.ch
+        self.cw = None
+        self.sr = None
+        self.ccs_sent = False
+        self.expect(plain_rec(22, self.ch, 0x0301))
+
+    def line(self, *words):
+        self.out.append(" ".join(str(w) for w in words))
+
+    def expect(self, data):
+        self.line("expect", hx(data))
+
+    def feed(self, data, chunk=0):
+        self.line("feed", chunk, hx(data))
+
+    def end(self):
+        self.line("end")
+
+    def alert(self, desc):
+        """The alert the client sends when it fails: protected once it has keys."""
+        body = bytes([2, desc])
+        return plain_rec(21, body) if self.cw is None else tls_seal(self.cw, 21, body)
+
+    def hello(self, suite=0x1303, version=0x0304, sid=None, share=None, extra=b"", retry=False,
+              group=0x001D, cookie=b"", legacy=0x0303):
+        """A ServerHello (or HelloRetryRequest) message."""
+        ext = b""
+        if retry:
+            if group:
+                ext += ext_of(51, u16(group))
+            if cookie:
+                ext += ext_of(44, u16(len(cookie)) + cookie)
+        else:
+            key = self.server_public if share is None else share
+            ext += ext_of(51, u16(group) + u16(len(key)) + key)
+        if version:
+            ext += ext_of(43, u16(version))
+        ext += extra
+        sid = self.sid if sid is None else sid
+        random = HRR_RANDOM if retry else rand_bytes(32)
+        body = u16(legacy) + random + bytes([len(sid)]) + sid + u16(suite) + b"\x00" + u16(len(ext)) + ext
+        return hs_msg(2, body)
+
+    def keys(self, sh):
+        """After the ServerHello: the handshake secrets, as both sides make them."""
+        sha = hashlib.sha256
+        self.transcript += sh
+        shared = x25519(self.key, self.server_public)
+        assert shared == x25519(self.server_key, self.public)
+        empty = sha(b"").digest()
+        early = pyhmac.new(b"\x00" * 32, b"\x00" * 32, sha).digest()
+        hs = pyhmac.new(expand_label(sha, early, b"derived", empty, 32), shared, sha).digest()
+        th = sha(self.transcript).digest()
+        self.c_hs = expand_label(sha, hs, b"c hs traffic", th, 32)
+        self.s_hs = expand_label(sha, hs, b"s hs traffic", th, 32)
+        self.master = pyhmac.new(expand_label(sha, hs, b"derived", empty, 32), b"\x00" * 32, sha).digest()
+        self.sr = tls_keys(self.s_hs)
+        self.cw = tls_keys(self.c_hs)
+
+    def retry(self, hrr):
+        """The client's answer to a HelloRetryRequest: a change_cipher_spec
+        and the ClientHello again with the cookie."""
+        cookie = b""
+        body = hrr[4:]
+        at = 2 + 32 + 1 + body[34] + 2 + 1 + 2
+        while at < len(body):
+            kind, n = int.from_bytes(body[at:at + 2], "big"), int.from_bytes(body[at + 2:at + 4], "big")
+            if kind == 44:
+                cookie = body[at + 6:at + 4 + n]
+            at += 4 + n
+        ch2 = tls_client_hello(self.host, self.random, self.sid, self.public, cookie)
+        self.transcript = b"\xfe\x00\x00\x20" + hashlib.sha256(self.transcript).digest() + hrr + ch2
+        self.ccs_sent = True
+        return plain_rec(20, b"\x01") + plain_rec(22, ch2)
+
+    def flight(self, scheme=0x0403, ee=b"", request=None, entries=None, bad_sig=False, bad_finished=False):
+        """EncryptedExtensions, [CertificateRequest,] Certificate,
+        CertificateVerify and Finished, as messages; the transcript and the
+        application secrets move on with them."""
+        sha = hashlib.sha256
+        msgs = [hs_msg(8, u16(len(ee)) + ee)]
+        self.request = request
+        if request is not None:
+            exts = ext_of(13, u16(2) + u16(0x0403))
+            msgs.append(hs_msg(13, bytes([len(request)]) + request + u16(len(exts)) + exts))
+        if entries is None:
+            entries = b"".join(u24(len(c)) + c + u16(0) for c in self.chain)
+        msgs.append(hs_msg(11, b"\x00" + u24(len(entries)) + entries))
+        for m in msgs:
+            self.transcript += m
+        content = b" " * 64 + b"TLS 1.3, server CertificateVerify\x00" + sha(self.transcript).digest()
+        sig = tls_sign(self.leaf, scheme, content)
+        if bad_sig:
+            sig = sig[:-1] + bytes([sig[-1] ^ 1])
+        cv = hs_msg(15, u16(scheme) + u16(len(sig)) + sig)
+        self.transcript += cv
+        vd = pyhmac.new(expand_label(sha, self.s_hs, b"finished", b"", 32), sha(self.transcript).digest(), sha).digest()
+        if bad_finished:
+            vd = vd[:-1] + bytes([vd[-1] ^ 1])
+        fin = hs_msg(20, vd)
+        self.transcript += fin
+        th = sha(self.transcript).digest()
+        self.c_ap = expand_label(sha, self.master, b"c ap traffic", th, 32)
+        self.s_ap = expand_label(sha, self.master, b"s ap traffic", th, 32)
+        return msgs + [cv, fin]
+
+    def after_finished(self):
+        """The server's records after its Finished use its application keys."""
+        self.sr = tls_keys(self.s_ap)
+
+    def finish(self):
+        """The client's last flight once its check of the chain passes."""
+        sha = hashlib.sha256
+        out = b""
+        if not self.ccs_sent:
+            out += plain_rec(20, b"\x01")
+            self.ccs_sent = True
+        if self.request is not None:
+            cm = hs_msg(11, bytes([len(self.request)]) + self.request + u24(0))
+            self.transcript += cm
+            out += tls_seal(self.cw, 22, cm)
+        vd = pyhmac.new(expand_label(sha, self.c_hs, b"finished", b"", 32), sha(self.transcript).digest(), sha).digest()
+        fin = hs_msg(20, vd)
+        self.transcript += fin
+        out += tls_seal(self.cw, 22, fin)
+        self.cw = tls_keys(self.c_ap)
+        return out
+
+    def handshake(self, check=True, **kw):
+        """The usual way there: ServerHello and a change_cipher_spec in the
+        clear, the rest in one protected record, the client's check passed."""
+        sh = self.hello()
+        self.keys(sh)
+        msgs = self.flight(**kw)
+        self.feed(plain_rec(22, sh) + plain_rec(20, b"\x01") + tls_seal(self.sr, 22, b"".join(msgs)))
+        self.after_finished()
+        self.line("state", "check")
+        if check:
+            self.line("check")
+            self.expect(self.finish())
+            self.line("state", "open")
+
+
+def tls13_vectors():
+    y = lambda year, month=1, day=1: datetime.datetime(year, month, day, tzinfo=UTC)  # noqa: E731
+    now = y(2026, 6)
+    k_root, k_int = test_key("p384"), test_key("p256")
+    k_ec, k_384, k_rsa = test_key("p256"), test_key("p384"), test_key("rsa")
+    root = make_cert("TLS Test Root", k_root, "TLS Test Root", k_root, profile("root", k_root, k_root), y(2020), y(2040))
+    inter = make_cert("TLS Test CA", k_int, "TLS Test Root", k_root, profile("ca", k_int, k_root), y(2025), y(2030))
+
+    def leaf(key, names):
+        return make_cert(names[0], key, "TLS Test CA", k_int, profile("leaf", key, k_int, names), y(2026, 3), y(2026, 9))
+
+    ec_chain = [leaf(k_ec, ["tls.example", "*.tls.example"]), inter]
+    p384_chain = [leaf(k_384, ["p384.example"]), inter]
+    rsa_chain = [leaf(k_rsa, ["rsa.example"]), inter]
+    out = ["# exchange name, then steps: client host random session-id x25519-key (and start);",
+           "# root der; now ms; expect bytes (what the client has sent since; - for nothing);",
+           "# feed chunk-size bytes (0 for all at once); check (the chain, then accept or",
+           "# reject); state waiting|check|open|closed; alert code (the one the client sent);",
+           "# send data; app data (what the client received); send_pattern and app_pattern n",
+           "# (n bytes, i % 251); peer_closed; close; end"]
+
+    def ex(name, host="tls.example", chain=ec_chain, key=k_ec):
+        return TlsScript(out, name, host, now, [root], chain, key)
+
+    # the way it goes: a P-256 server, a request, a ticket, an answer, both closing
+    t = ex("ecdsa")
+    t.handshake()
+    request = b"GET / HTTP/1.1\r\nHost: tls.example\r\n\r\n"
+    t.line("send", hx(request))
+    t.expect(tls_seal(t.cw, 23, request))
+    answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"
+    t.feed(tls_seal(t.sr, 22, hs_msg(4, rand_bytes(40))) + tls_seal(t.sr, 23, answer))
+    t.line("app", hx(answer))
+    t.feed(tls_seal(t.sr, 21, b"\x01\x00"))
+    t.line("peer_closed")
+    t.line("close")
+    t.expect(tls_seal(t.cw, 21, b"\x01\x00"))
+    t.line("state", "closed")
+    t.end()
+
+    # the same, a byte at a time, one message to a record, padded
+    t = ex("a byte at a time")
+    sh = t.hello()
+    t.keys(sh)
+    flight = b"".join(tls_seal(t.sr, 22, m, pad=i * 7) for i, m in enumerate(t.flight()))
+    t.feed(plain_rec(22, sh) + flight, 1)
+    t.after_finished()
+    t.line("check")
+    t.expect(t.finish())
+    # past the largest record: 16384 bytes, then the rest (the data is
+    # bytes i % 251, written as a length to keep the file small)
+    big = bytes(i % 251 for i in range(16400))
+    t.feed(tls_seal(t.sr, 23, big[:16384]) + tls_seal(t.sr, 23, big[16384:]), 1000)
+    t.line("app_pattern", len(big))
+    t.line("send_pattern", len(big))
+    t.expect(tls_seal(t.cw, 23, big[:16384]) + tls_seal(t.cw, 23, big[16384:]))
+    t.end()
+
+    for name, host, chain, key, scheme in [("RSA-PSS", "rsa.example", rsa_chain, k_rsa, 0x0804),
+                                           ("RSA-PSS with SHA-384", "rsa.example", rsa_chain, k_rsa, 0x0805),
+                                           ("P-384", "p384.example", p384_chain, k_384, 0x0503)]:
+        t = ex(name, host, chain, key)
+        t.handshake(scheme=scheme)
+        t.line("send", hx(b"ping"))
+        t.expect(tls_seal(t.cw, 23, b"ping"))
+        t.end()
+
+    # a Certificate split across two records, with the other messages
+    t = ex("a message across records")
+    sh = t.hello()
+    t.keys(sh)
+    msgs = b"".join(t.flight())
+    cut = len(msgs) // 2
+    t.feed(plain_rec(22, sh) + tls_seal(t.sr, 22, msgs[:cut]) + tls_seal(t.sr, 22, msgs[cut:]))
+    t.after_finished()
+    t.line("check")
+    t.expect(t.finish())
+    t.line("state", "open")
+    t.end()
+
+    # data from the server right after its Finished (0.5-RTT), kept until the check
+    t = ex("data before the check")
+    sh = t.hello()
+    t.keys(sh)
+    msgs = t.flight()
+    early = tls_seal(t.sr, 22, b"".join(msgs))
+    t.after_finished()
+    t.feed(plain_rec(22, sh) + early + tls_seal(t.sr, 23, b"early words"))
+    t.line("state", "check")
+    t.line("check")
+    t.expect(t.finish())
+    t.line("app", hx(b"early words"))
+    t.end()
+
+    # the server updates its keys and asks for the client's to change too
+    t = ex("key update")
+    t.handshake()
+    t.feed(tls_seal(t.sr, 22, hs_msg(24, b"\x01")))
+    t.sr = tls_keys(expand_label(hashlib.sha256, t.sr["secret"], b"traffic upd", b"", 32))
+    t.expect(tls_seal(t.cw, 22, hs_msg(24, b"\x00")))
+    t.cw = tls_keys(expand_label(hashlib.sha256, t.cw["secret"], b"traffic upd", b"", 32))
+    t.feed(tls_seal(t.sr, 23, b"under new keys"))
+    t.line("app", hx(b"under new keys"))
+    t.line("send", hx(b"and mine"))
+    t.expect(tls_seal(t.cw, 23, b"and mine"))
+    t.end()
+
+    # a server that asks for a client certificate is told there is none
+    t = ex("certificate request")
+    t.handshake(request=b"ctx")
+    t.end()
+
+    # a HelloRetryRequest with a cookie, then the handshake
+    t = ex("hello retry")
+    hrr = t.hello(retry=True, group=0, cookie=rand_bytes(24))
+    t.feed(plain_rec(22, hrr))
+    t.expect(t.retry(hrr))
+    t.handshake()
+    t.end()
+
+    # the chain is refused: a certificate for another host
+    t = ex("the wrong host", host="other.example")
+    t.handshake(check=False)
+    t.line("check")
+    t.expect(t.alert(42))
+    t.line("state", "closed")
+    t.line("alert", 42)
+    t.end()
+
+    # what the client refuses before there are keys (alerts in the clear)
+    for name, desc, kw in [("a TLS 1.2 server", 70, {"version": 0}),
+                           ("another cipher suite", 47, {"suite": 0x1301}),
+                           ("another session id", 47, {"sid": rand_bytes(32)}),
+                           ("an extension not asked for", 110, {"extra": ext_of(23, b"")}),
+                           ("a key share of small order", 47, {"share": b"\x00" * 32}),
+                           ("a wrong legacy version", 47, {"legacy": 0x0301})]:
+        t = ex(name)
+        t.feed(plain_rec(22, t.hello(**kw)))
+        t.expect(t.alert(desc))
+        t.line("state", "closed")
+        t.line("alert", desc)
+        t.end()
+    for name, desc, hrr_kw in [("a HelloRetryRequest for X25519", 47, {"group": 0x001D}),
+                               ("a HelloRetryRequest for nothing", 47, {"group": 0})]:
+        t = ex(name)
+        t.feed(plain_rec(22, t.hello(retry=True, **hrr_kw)))
+        t.expect(t.alert(desc))
+        t.line("alert", desc)
+        t.end()
+    t = ex("a second HelloRetryRequest")
+    hrr = t.hello(retry=True, group=0, cookie=b"cookie")
+    t.feed(plain_rec(22, hrr))
+    t.expect(t.retry(hrr))
+    t.feed(plain_rec(22, t.hello(retry=True, group=0, cookie=b"again")))
+    t.expect(t.alert(10))
+    t.line("alert", 10)
+    t.end()
+    for name, desc, data in [("application data before the handshake", 10, plain_rec(23, b"hello")),
+                             ("a record too long", 22, bytes([23, 3, 3]) + u16(18000))]:
+        t = ex(name)
+        t.feed(data)
+        t.expect(t.alert(desc))
+        t.line("alert", desc)
+        t.end()
+    for name, body in [("the server's alert", b"\x02\x28"), ("a close during the handshake", b"\x01\x00")]:
+        t = ex(name)
+        t.feed(plain_rec(21, body))
+        t.expect(b"")
+        t.line("state", "closed")
+        t.line("alert", 0)
+        t.end()
+
+    # what the client refuses once there are keys (protected alerts)
+    def refused(name, desc, host="tls.example", chain=ec_chain, key=k_ec, tamper=False, trailing=b"", **kw):
+        t = ex(name, host, chain, key)
+        sh = t.hello()
+        t.keys(sh)
+        rec = tls_seal(t.sr, 22, b"".join(t.flight(**kw)))
+        if tamper:
+            rec = rec[:20] + bytes([rec[20] ^ 1]) + rec[21:]
+        t.feed(plain_rec(22, sh) + rec + trailing)
+        t.expect(t.alert(desc))
+        t.line("state", "closed")
+        t.line("alert", desc)
+        t.end()
+
+    refused("a bad Finished", 51, bad_finished=True)
+    refused("a bad signature", 51, bad_sig=True)
+    refused("PKCS #1 in CertificateVerify", 47, "rsa.example", rsa_chain, k_rsa, scheme=0x0401)
+    refused("a scheme for another key", 47, "p384.example", p384_chain, k_384, scheme=0x0403)
+    refused("an extension not asked for, encrypted", 110, ee=ext_of(16, u16(9) + b"\x08http/1.1"))
+    refused("a tampered record", 20, tamper=True)
+    refused("certificate entry extensions", 110, entries=u24(len(ec_chain[0])) + ec_chain[0] + u16(4) + ext_of(5, b""))
+    refused("no certificate", 50, entries=b"")
+    refused("a change_cipher_spec after Finished", 10, trailing=plain_rec(20, b"\x01"))
+    t = ex("a ServerHello running into the next message")
+    sh = t.hello()
+    t.keys(sh)
+    t.feed(plain_rec(22, sh + hs_msg(8, u16(0))))
+    t.expect(t.alert(10))
+    t.line("alert", 10)
+    t.end()
+    t = ex("a KeyUpdate asking for the impossible")
+    t.handshake()
+    t.feed(tls_seal(t.sr, 22, hs_msg(24, b"\x02")))
+    t.expect(t.alert(47))
+    t.line("alert", 47)
+    t.end()
+    return "\n".join(out) + "\n"
+
+
 # ------------------------------------------------------------------ main
 
 OUTPUTS = {
@@ -1557,6 +2036,8 @@ OUTPUTS = {
     "tests/vectors/ecdsa.txt": ecdsa_vectors,
     "tests/vectors/rsa.txt": rsa_vectors,
     "tests/vectors/x509.txt": x509_vectors,
+    "tests/vectors/tls13_rfc8448.txt": tls13_rfc8448_vectors,
+    "tests/vectors/tls13.txt": tls13_vectors,
 }
 
 

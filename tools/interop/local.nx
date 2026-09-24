@@ -1,0 +1,53 @@
+// One connection to a local TLS server, judged: local <port> <roots.pem>
+// <open|refused> <what>. Prints PASS or FAIL and why; exits 1 on FAIL.
+// tools/interop/run.sh runs it against openssl s_server.
+
+import std.fs
+import nxtls.tls
+import nxtls.x509
+
+fn verdict(ok: bool, what: []u8, detail: []u8) {
+    if ok {
+        println("PASS  {}: {}", .{what, detail})
+        return
+    }
+    println("FAIL  {}: {}", .{what, detail})
+    os.exit(1)
+}
+
+fn main() {
+    let argv = os.args()
+    if argv.len < 5 {
+        println("usage: local <port> <roots.pem> <open|refused> <what>")
+        os.exit(2)
+    }
+    let port = argv[1].parse_int(u16) catch 4433
+    let bundle = fs.read(argv[2]) catch {
+        println("cannot read {}", .{argv[2]})
+        os.exit(2)
+        return
+    }
+    let want_open = argv[3] == "open"
+    let what = argv[4]
+    let roots = x509.store_from_pem(bundle)
+    var conn = tls.connect("localhost", port, &roots, time.now(), 5000)
+    if !conn.is_open() {
+        let detail = format("refused: {}", .{conn.problem})
+        verdict(!want_open, what, detail)
+        return
+    }
+    conn.send("GET / HTTP/1.0\r\n\r\n") catch {
+        verdict(false, what, "the request could not be sent")
+        return
+    }
+    let reply = conn.read_all(1 << 20) catch |e| {
+        let detail = format("reading the answer failed ({})", .{@errorName(e)})
+        verdict(false, what, detail)
+        return
+    }
+    conn.close()
+    let first = reply.find("\n") orelse reply.len
+    let answered = reply.starts_with("HTTP/1.0 200")
+    let detail = format("open; {} bytes; {}", .{reply.len, reply[0..first].trim()})
+    verdict(want_open and answered, what, detail)
+}

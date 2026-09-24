@@ -1,0 +1,92 @@
+// entropy.nx: random bytes from the operating system, for keys, nonces
+// and anything else an attacker must not guess.
+//
+// `import nxtls.entropy` then:
+//
+//     let key = try entropy.bytes(32)
+//
+// The bytes come from /dev/urandom (Linux, macOS, the BSDs), the kernel's
+// generator, which never blocks once it has been seeded at boot and is
+// what getrandom(2) and arc4random(3) read too. Nexium's std has no other
+// entropy source yet, so where there is no /dev/urandom (Windows)
+// `bytes` fails with error.NoEntropy rather than falling back to anything
+// weaker: a program there keeps its TLS forwarder.
+//
+// A device has no size; a regular file does, so one planted at the path
+// (on Windows the path means \dev\urandom on the current drive) is
+// refused rather than read as randomness.
+
+import std.fs
+import std.stream
+
+const SOURCE: []u8 = "/dev/urandom"
+
+/// `n` bytes from the operating system's generator; error.NoEntropy when
+/// there is none or it cannot be read.
+pub fn bytes(n: usize) -> !String {
+    let size = fs.size(SOURCE) catch {
+        return error.NoEntropy
+    }
+    if size != 0 {
+        return error.NoEntropy
+    }
+    var r = stream.Reader.open(SOURCE) catch {
+        return error.NoEntropy
+    }
+    var out = String.with_capacity(n)
+    while out.len < n {
+        let chunk = r.read(n - out.len) catch {
+            r.close()
+            return error.NoEntropy
+        }
+        if chunk.len == 0 {
+            r.close()
+            return error.NoEntropy
+        }
+        out.append(chunk)
+    }
+    r.close()
+    return out
+}
+
+/// Whether this system has a generator `bytes` can read.
+pub fn available() -> bool {
+    let probe = bytes(1) catch {
+        return false
+    }
+    return probe.len == 1
+}
+
+// ------------------------------------------------------------------ tests
+
+test "bytes where the system has a generator, a clean error where it has none" {
+    if !available() {
+        // Windows: no /dev/urandom, and no quiet fallback
+        let got = bytes(32) catch |e| {
+            expect_eq(@errorName(e), "NoEntropy")
+            return
+        }
+        expect(got.len == 99)
+        return
+    }
+    let a = try bytes(32)
+    let b = try bytes(32)
+    expect_eq(a.len, 32)
+    expect_eq(b.len, 32)
+    expect(a != b)
+    expect_eq((try bytes(0)).len, 0)
+    // more than one read's worth
+    expect_eq((try bytes(100000)).len, 100000)
+    // every value of a byte turns up in 64 KB (a stuck or constant source would not)
+    let big = try bytes(65536)
+    var seen = List(bool).new()
+    for _ in 0..256 {
+        seen.append(false)
+    }
+    for x in big {
+        seen[x as usize] = true
+    }
+    for s in seen {
+        expect(s)
+    }
+}

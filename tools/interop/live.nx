@@ -1,0 +1,57 @@
+// nxtls against real servers, with the system's CA bundle: live [bundle].
+// The hosts QNI talks to must answer (exit 1 otherwise); the rest are
+// shown for interest. Needs the network, so CI does not run it.
+
+import std.fs
+import nxtls.tls
+import nxtls.x509
+
+// the first line of the answer to a GET, or why there was none
+fn get(host: []u8, path: []u8, roots: *x509.Store) -> ?String {
+    var conn = tls.connect(host, 443, roots, time.now(), 10000)
+    if !conn.is_open() {
+        println("      {}: {}", .{host, conn.problem})
+        return null
+    }
+    let req = format("GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: nxtls-interop\r\nConnection: close\r\n\r\n", .{path, host})
+    conn.send(req) catch {
+        println("      {}: the request could not be sent", .{host})
+        return null
+    }
+    let reply = conn.read_all(8 << 20) catch |e| {
+        println("      {}: reading the answer failed ({})", .{host, @errorName(e)})
+        return null
+    }
+    conn.close()
+    let first = reply.find("\r\n") orelse reply.len
+    return format("{} ({} bytes)", .{reply[0..first], reply.len})
+}
+
+fn main() {
+    let argv = os.args()
+    let path = if argv.len > 1 { argv[1] } else { "/etc/ssl/certs/ca-certificates.crt" }
+    let bundle = fs.read(path) catch {
+        println("cannot read the CA bundle {}", .{path})
+        os.exit(2)
+        return
+    }
+    let roots = x509.store_from_pem(bundle)
+    println("{} roots from {} ({} skipped)", .{roots.certs.len, path, roots.skipped})
+    var failed = 0
+    for h in [["discord.com", "/api/v10/gateway"], ["gateway.discord.gg", "/"], ["cdn.discordapp.com", "/"], ["callook.info", "/W1AW/json"]] {
+        if let line = get(h[0], h[1], &roots) {
+            println("PASS  {}: {}", .{h[0], line})
+        } else {
+            println("FAIL  {}", .{h[0]})
+            failed += 1
+        }
+    }
+    for host in ["www.google.com", "github.com", "www.cloudflare.com", "www.echolink.org"] {
+        if let line = get(host, "/", &roots) {
+            println("      {}: {}", .{host, line})
+        }
+    }
+    if failed > 0 {
+        os.exit(1)
+    }
+}

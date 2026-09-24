@@ -1,0 +1,1529 @@
+// tls.nx: a TLS 1.3 client (RFC 8446), for a program's HTTPS and
+// WebSocket connections.
+//
+// `import nxtls.tls` then:
+//
+//     var conn = tls.connect("discord.com", 443, &roots, time.now(), 10000)
+//     if !conn.is_open() {
+//         // conn.problem says why: no route, a bad certificate, an alert...
+//     }
+//     try conn.send("GET / HTTP/1.1\r\nHost: discord.com\r\nConnection: close\r\n\r\n")
+//     let reply = try conn.read_all(1 << 20)       // until the server closes
+//     conn.close()
+//
+// What it speaks: TLS 1.3 only, with one cipher suite
+// (TLS_CHACHA20_POLY1305_SHA256), one key exchange (X25519), and the
+// server's handshake signature by ECDSA on P-256 or P-384 or by RSA-PSS,
+// its certificate chain checked by x509.nx against the roots given for
+// the host connected to. A server that cannot do all that is refused,
+// never met halfway. No resumption, no early data, no client certificate
+// (a server that asks for one is told there is none), and the middlebox
+// compatibility of RFC 8446 D.4 (a session id, a change_cipher_spec).
+//
+// `Client` is the protocol: it takes the bytes the server sent and gives
+// the bytes to send, and never touches a socket, so the tests replay whole
+// exchanges byte for byte. It stops before its last flight with the
+// server's certificates in `chain` (state CHECK_CHAIN) for the caller to
+// check, so the chain is judged before the handshake completes. `Conn`
+// runs a Client over a TCP connection from std.net, with its randomness
+// from entropy.nx.
+//
+// Secrets (the X25519 key, the traffic secrets and keys) pass only
+// through x25519.nx, hkdf.nx, hmac.nx and chacha20poly1305.nx, which are
+// constant time, and the server's Finished is compared in constant time.
+// Everything else here is public: records, handshake messages,
+// certificates.
+
+import std.net
+import chacha20poly1305
+import ct
+import ecdsa
+import entropy
+import hkdf
+import hmac
+import rsa
+import sha2
+import x25519
+import x509
+
+// record content types
+const CCS: u8 = 20
+const ALERT: u8 = 21
+const HANDSHAKE: u8 = 22
+const APP_DATA: u8 = 23
+
+// handshake messages
+const CLIENT_HELLO: u8 = 1
+const SERVER_HELLO: u8 = 2
+const NEW_SESSION_TICKET: u8 = 4
+const ENCRYPTED_EXTENSIONS: u8 = 8
+const CERTIFICATE: u8 = 11
+const CERTIFICATE_REQUEST: u8 = 13
+const CERTIFICATE_VERIFY: u8 = 15
+const FINISHED: u8 = 20
+const KEY_UPDATE: u8 = 24
+const MESSAGE_HASH: u8 = 254
+
+// extensions
+const EXT_SERVER_NAME: usize = 0
+const EXT_SUPPORTED_GROUPS: usize = 10
+const EXT_SIGNATURE_ALGORITHMS: usize = 13
+const EXT_SUPPORTED_VERSIONS: usize = 43
+const EXT_COOKIE: usize = 44
+const EXT_KEY_SHARE: usize = 51
+
+const TLS12: usize = 0x0303
+const TLS13: usize = 0x0304
+/// TLS_CHACHA20_POLY1305_SHA256
+const SUITE: usize = 0x1303
+const GROUP_X25519: usize = 0x001d
+
+// signature schemes (4.2.3): those a server may use in CertificateVerify,
+// then PKCS #1 v1.5, which TLS 1.3 allows in certificates only
+const ECDSA_P256_SHA256: usize = 0x0403
+const ECDSA_P384_SHA384: usize = 0x0503
+const RSA_PSS_SHA256: usize = 0x0804
+const RSA_PSS_SHA384: usize = 0x0805
+const RSA_PSS_SHA512: usize = 0x0806
+const SCHEMES: [8]usize = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601]
+
+// alert descriptions (6)
+pub const CLOSE_NOTIFY: u8 = 0
+pub const UNEXPECTED_MESSAGE: u8 = 10
+pub const BAD_RECORD_MAC: u8 = 20
+pub const RECORD_OVERFLOW: u8 = 22
+pub const BAD_CERTIFICATE: u8 = 42
+pub const ILLEGAL_PARAMETER: u8 = 47
+pub const DECODE_ERROR: u8 = 50
+pub const DECRYPT_ERROR: u8 = 51
+pub const PROTOCOL_VERSION: u8 = 70
+pub const INTERNAL_ERROR: u8 = 80
+pub const USER_CANCELED: u8 = 90
+pub const UNSUPPORTED_EXTENSION: u8 = 110
+
+const MAX_PLAINTEXT: usize = 16384
+/// the longest handshake message taken: room for a long chain
+const MAX_HANDSHAKE: usize = 131072
+
+/// SHA-256("HelloRetryRequest"), the random that makes a ServerHello a
+/// HelloRetryRequest (4.1.3)
+const HRR_RANDOM: []u8 = b"\xcf\x21\xad\x74\xe5\x9a\x61\x11\xbe\x1d\x8c\x02\x1e\x65\xb8\x91\xc2\xa2\x11\x16\x7a\xbb\x8c\x5e\x07\x9e\x09\xe2\xc8\xa8\x33\x9c"
+
+// where the handshake is
+const START: u8 = 0
+const WAIT_SH: u8 = 1
+const WAIT_EE: u8 = 2
+const WAIT_CERT_CR: u8 = 3
+const WAIT_CERT: u8 = 4
+const WAIT_CV: u8 = 5
+const WAIT_FINISHED: u8 = 6
+/// The server's flight is in and all of it checks out but its chain: the
+/// caller checks `chain`, then calls accept_chain or reject_chain.
+pub const CHECK_CHAIN: u8 = 7
+/// The handshake is complete.
+pub const OPEN: u8 = 8
+/// Failed or closed; `problem` says why when it failed.
+pub const CLOSED: u8 = 9
+
+// ------------------------------------------------------------------ the key schedule
+
+fn zeros(n: usize) -> String {
+    var out = String.with_capacity(n)
+    for _ in 0..n {
+        out.push_byte(0)
+    }
+    return out
+}
+
+// HKDF-Expand-Label with an empty context; every length here is one it
+// takes, so it cannot fail
+fn expand(secret: []u8, label: []u8, len: usize) -> String {
+    return hkdf.expand_label(sha2.Kind.Sha256, secret, label, "", len) catch String.new()
+}
+
+fn derive(secret: []u8, label: []u8, transcript_hash: []u8) -> String {
+    return hkdf.derive_secret(sha2.Kind.Sha256, secret, label, transcript_hash) catch String.new()
+}
+
+/// The handshake's secrets (7.1).
+pub struct Secrets {
+    handshake: String
+    c_hs: String
+    s_hs: String
+    master: String
+}
+
+/// The secrets from the X25519 shared secret and the transcript's hash
+/// through the ServerHello (no pre-shared key).
+pub fn schedule(shared: []u8, hello_hash: []u8) -> Secrets {
+    let kind = sha2.Kind.Sha256
+    let empty = sha2.sha256("")
+    let early = hkdf.extract(kind, "", zeros(32))
+    let hs = hkdf.extract(kind, derive(early, "derived", empty), shared)
+    let c_hs = derive(hs, "c hs traffic", hello_hash)
+    let s_hs = derive(hs, "s hs traffic", hello_hash)
+    let master = hkdf.extract(kind, derive(hs, "derived", empty), zeros(32))
+    return Secrets{ .handshake = hs, .c_hs = c_hs, .s_hs = s_hs, .master = master }
+}
+
+/// An application traffic secret ("c ap traffic" or "s ap traffic") from
+/// the master secret and the transcript's hash through the server's
+/// Finished.
+pub fn app_secret(master: []u8, label: []u8, finished_hash: []u8) -> String {
+    return derive(master, label, finished_hash)
+}
+
+/// Finished's verify_data (4.4.4) under a handshake traffic secret.
+pub fn verify_data(secret: []u8, transcript_hash: []u8) -> String {
+    return hmac.mac(sha2.Kind.Sha256, expand(secret, "finished", 32), transcript_hash)
+}
+
+// ------------------------------------------------------------------ records
+
+// one direction's record protection (5.2, 5.3, 7.3)
+struct Keys {
+    secret: String
+    key: String
+    iv: String
+    seq: u64
+    on: bool
+}
+
+fn no_keys() -> Keys {
+    return Keys{ .secret = String.new(), .key = String.new(), .iv = String.new(), .seq = 0, .on = false }
+}
+
+fn keys_of(secret: []u8) -> Keys {
+    return Keys{ .secret = String.from(secret), .key = expand(secret, "key", 32), .iv = expand(secret, "iv", 12), .seq = 0, .on = true }
+}
+
+// the record's nonce: the iv with the sequence number XORed into its end
+fn nonce(k: *Keys) -> String {
+    var n = String.with_capacity(12)
+    for i in 0..k.iv.len {
+        var b = k.iv[i]
+        if i >= 4 {
+            b ^= @truncate(u8, k.seq >> ((8 * (11 - i)) as u64))
+        }
+        n.push_byte(b)
+    }
+    return n
+}
+
+// a protected record: the content and its type sealed, with the record's
+// header as additional data; the sequence number moves on
+fn seal_record(k: *mut Keys, kind: u8, data: []u8) -> String {
+    var inner = String.with_capacity(data.len + 1)
+    inner.append(data)
+    inner.push_byte(kind)
+    var out = String.with_capacity(inner.len + 21)
+    out.push_byte(APP_DATA)
+    out.push_byte(3)
+    out.push_byte(3)
+    put16(&mut out, inner.len + 16)
+    let sealed = chacha20poly1305.seal(k.key, nonce(k), out, inner) catch String.new()
+    k.seq += 1
+    out.append(sealed)
+    return out
+}
+
+// a record's content once opened: its type (0 when it was all padding) and
+// the content without the padding
+struct Plain {
+    kind: u8
+    data: String
+}
+
+fn open_record(k: *mut Keys, header: []u8, body: []u8) -> ?Plain {
+    let inner = chacha20poly1305.open(k.key, nonce(k), header, body) orelse return null
+    k.seq += 1
+    var end = inner.len
+    while end > 0 and inner[end - 1] == 0 {
+        end -= 1
+    }
+    if end == 0 {
+        return Plain{ .kind = 0, .data = String.new() }
+    }
+    return Plain{ .kind = inner[end - 1], .data = String.from(inner[0..end - 1]) }
+}
+
+// ------------------------------------------------------------------ writing and reading messages
+
+fn put16(out: *mut String, v: usize) {
+    out.push_byte(@truncate(u8, v >> 8))
+    out.push_byte(@truncate(u8, v))
+}
+
+fn put24(out: *mut String, v: usize) {
+    out.push_byte(@truncate(u8, v >> 16))
+    put16(out, v)
+}
+
+fn put_ext(out: *mut String, kind: usize, data: []u8) {
+    put16(out, kind)
+    put16(out, data.len)
+    out.append(data)
+}
+
+// a handshake message: its type, its length, its body
+fn message_of(kind: u8, body: []u8) -> String {
+    var out = String.with_capacity(body.len + 4)
+    out.push_byte(kind)
+    put24(&mut out, body.len)
+    out.append(body)
+    return out
+}
+
+// Each reader moves `at` past what it read, and gives null when the bytes
+// run out.
+fn get8(b: []u8, at: *mut usize) -> ?usize {
+    if at.* >= b.len {
+        return null
+    }
+    let v = b[at.*] as usize
+    at.* += 1
+    return v
+}
+
+fn get16(b: []u8, at: *mut usize) -> ?usize {
+    let hi = get8(b, at) orelse return null
+    let lo = get8(b, at) orelse return null
+    return (hi << 8) | lo
+}
+
+fn get24(b: []u8, at: *mut usize) -> ?usize {
+    let hi = get8(b, at) orelse return null
+    let lo = get16(b, at) orelse return null
+    return (hi << 16) | lo
+}
+
+fn take(b: []u8, at: *mut usize, n: usize) -> ?[]u8 {
+    if n > b.len - at.* {
+        return null
+    }
+    let s = b[at.*..at.* + n]
+    at.* += n
+    return s
+}
+
+// vectors with a one, two or three byte length before them
+fn vec8(b: []u8, at: *mut usize) -> ?[]u8 {
+    let n = get8(b, at) orelse return null
+    return take(b, at, n)
+}
+
+fn vec16(b: []u8, at: *mut usize) -> ?[]u8 {
+    let n = get16(b, at) orelse return null
+    return take(b, at, n)
+}
+
+fn vec24(b: []u8, at: *mut usize) -> ?[]u8 {
+    let n = get24(b, at) orelse return null
+    return take(b, at, n)
+}
+
+struct Ext {
+    kind: usize
+    data: String
+}
+
+// an extension block as its extensions; null when it is malformed or has
+// one type twice (4.2)
+fn extensions(b: []u8) -> ?List(Ext) {
+    var out = List(Ext).new()
+    var at: usize = 0
+    while at < b.len {
+        let kind = get16(b, &mut at) orelse return null
+        let data = vec16(b, &mut at) orelse return null
+        for e in out {
+            if e.kind == kind {
+                return null
+            }
+        }
+        out.append(Ext{ .kind = kind, .data = String.from(data) })
+    }
+    return out
+}
+
+// whether `host` is a name, which server_name carries, rather than an IP
+// address, which it may not (RFC 6066 3)
+fn host_name(host: []u8) -> bool {
+    if host.find(":") != null {
+        return false
+    }
+    for ch in host {
+        if (ch < '0' or ch > '9') and ch != '.' {
+            return true
+        }
+    }
+    return false
+}
+
+// the ClientHello (4.1.2), header and all
+fn client_hello(host: []u8, random: []u8, session_id: []u8, public: []u8, cookie: []u8) -> String {
+    var ext = String.new()
+    if host_name(host) {
+        var sni = String.new()
+        put16(&mut sni, host.len + 3)
+        sni.push_byte(0)
+        put16(&mut sni, host.len)
+        sni.append(host)
+        put_ext(&mut ext, EXT_SERVER_NAME, sni)
+    }
+    var groups = String.new()
+    put16(&mut groups, 2)
+    put16(&mut groups, GROUP_X25519)
+    put_ext(&mut ext, EXT_SUPPORTED_GROUPS, groups)
+    var algs = String.new()
+    put16(&mut algs, 2 * SCHEMES.len)
+    for s in SCHEMES {
+        put16(&mut algs, s)
+    }
+    put_ext(&mut ext, EXT_SIGNATURE_ALGORITHMS, algs)
+    var versions = String.new()
+    versions.push_byte(2)
+    put16(&mut versions, TLS13)
+    put_ext(&mut ext, EXT_SUPPORTED_VERSIONS, versions)
+    var share = String.new()
+    put16(&mut share, public.len + 4)
+    put16(&mut share, GROUP_X25519)
+    put16(&mut share, public.len)
+    share.append(public)
+    put_ext(&mut ext, EXT_KEY_SHARE, share)
+    if cookie.len > 0 {
+        var c = String.new()
+        put16(&mut c, cookie.len)
+        c.append(cookie)
+        put_ext(&mut ext, EXT_COOKIE, c)
+    }
+    var body = String.new()
+    put16(&mut body, TLS12)
+    body.append(random)
+    body.push_byte(@truncate(u8, session_id.len))
+    body.append(session_id)
+    put16(&mut body, 2)
+    put16(&mut body, SUITE)
+    body.push_byte(1)
+    body.push_byte(0)
+    put16(&mut body, ext.len)
+    body.append(ext)
+    return message_of(CLIENT_HELLO, body)
+}
+
+// a ServerHello or HelloRetryRequest (4.1.3, 4.1.4), read
+struct Hello {
+    legacy_version: usize
+    random: String
+    session_id: String
+    suite: usize
+    compression: usize
+    /// from supported_versions; 0 when it is absent
+    version: usize
+    /// from key_share; 0 when it is absent
+    group: usize
+    share: String
+    cookie: String
+    /// an extension a ServerHello may not carry
+    stray: bool
+}
+
+fn parse_hello(b: []u8) -> ?Hello {
+    var at: usize = 0
+    let legacy = get16(b, &mut at) orelse return null
+    let random = take(b, &mut at, 32) orelse return null
+    let sid = vec8(b, &mut at) orelse return null
+    let suite = get16(b, &mut at) orelse return null
+    let compression = get8(b, &mut at) orelse return null
+    let block = vec16(b, &mut at) orelse return null
+    if at != b.len or sid.len > 32 {
+        return null
+    }
+    let retry = random == HRR_RANDOM
+    var h = Hello{ .legacy_version = legacy, .random = String.from(random), .session_id = String.from(sid), .suite = suite, .compression = compression, .version = 0, .group = 0, .share = String.new(), .cookie = String.new(), .stray = false }
+    let exts = extensions(block) orelse return null
+    for e in exts {
+        var p: usize = 0
+        if e.kind == EXT_SUPPORTED_VERSIONS {
+            h.version = get16(e.data, &mut p) orelse return null
+        } else if e.kind == EXT_KEY_SHARE {
+            h.group = get16(e.data, &mut p) orelse return null
+            if !retry {
+                let key = vec16(e.data, &mut p) orelse return null
+                h.share = String.from(key)
+            }
+        } else if e.kind == EXT_COOKIE and retry {
+            let cookie = vec16(e.data, &mut p) orelse return null
+            if cookie.len == 0 {
+                return null
+            }
+            h.cookie = String.from(cookie)
+        } else {
+            h.stray = true
+            p = e.data.len
+        }
+        if p != e.data.len {
+            return null
+        }
+    }
+    return h
+}
+
+// 0 when `sig` by the server's key over `content` is good under `scheme`;
+// 1 when it is not; 2 when the scheme is not one nxtls offered for
+// CertificateVerify, or does not fit the key (4.2.3)
+fn check_signature(scheme: usize, kind: x509.KeyKind, key: []u8, e: []u8, content: []u8, sig: []u8) -> u8 {
+    if scheme == ECDSA_P256_SHA256 and kind == x509.KeyKind.P256 {
+        if ecdsa.verify(ecdsa.Curve.P256, key, sha2.sha256(content), sig) {
+            return 0
+        }
+        return 1
+    }
+    if scheme == ECDSA_P384_SHA384 and kind == x509.KeyKind.P384 {
+        if ecdsa.verify(ecdsa.Curve.P384, key, sha2.sha384(content), sig) {
+            return 0
+        }
+        return 1
+    }
+    if kind == x509.KeyKind.Rsa and (scheme == RSA_PSS_SHA256 or scheme == RSA_PSS_SHA384 or scheme == RSA_PSS_SHA512) {
+        let h = if scheme == RSA_PSS_SHA256 { sha2.Kind.Sha256 } else if scheme == RSA_PSS_SHA384 { sha2.Kind.Sha384 } else { sha2.Kind.Sha512 }
+        if rsa.verify_pss(key, e, h, sha2.hash(h, content), sig) {
+            return 0
+        }
+        return 1
+    }
+    return 2
+}
+
+/// The name of an alert, for messages.
+pub fn alert_name(d: u8) -> []u8 {
+    if d == 0 {
+        return "close_notify"
+    }
+    if d == 10 {
+        return "unexpected_message"
+    }
+    if d == 20 {
+        return "bad_record_mac"
+    }
+    if d == 22 {
+        return "record_overflow"
+    }
+    if d == 40 {
+        return "handshake_failure"
+    }
+    if d == 42 {
+        return "bad_certificate"
+    }
+    if d == 43 {
+        return "unsupported_certificate"
+    }
+    if d == 44 {
+        return "certificate_revoked"
+    }
+    if d == 45 {
+        return "certificate_expired"
+    }
+    if d == 46 {
+        return "certificate_unknown"
+    }
+    if d == 47 {
+        return "illegal_parameter"
+    }
+    if d == 48 {
+        return "unknown_ca"
+    }
+    if d == 49 {
+        return "access_denied"
+    }
+    if d == 50 {
+        return "decode_error"
+    }
+    if d == 51 {
+        return "decrypt_error"
+    }
+    if d == 70 {
+        return "protocol_version"
+    }
+    if d == 71 {
+        return "insufficient_security"
+    }
+    if d == 80 {
+        return "internal_error"
+    }
+    if d == 86 {
+        return "inappropriate_fallback"
+    }
+    if d == 90 {
+        return "user_canceled"
+    }
+    if d == 109 {
+        return "missing_extension"
+    }
+    if d == 110 {
+        return "unsupported_extension"
+    }
+    if d == 112 {
+        return "unrecognized_name"
+    }
+    if d == 116 {
+        return "certificate_required"
+    }
+    if d == 120 {
+        return "no_application_protocol"
+    }
+    return "unknown"
+}
+
+// ------------------------------------------------------------------ the client
+
+/// A TLS 1.3 client's side of one connection, as bytes in and bytes out.
+pub struct Client {
+    host: String
+    state: u8
+    /// why the connection failed or was refused, when it was
+    problem: String
+    /// the alert this side sent when it failed (0 for none)
+    alert_sent: u8
+    /// the server's certificates as it sent them, its own first (DER)
+    chain: List(String)
+    /// whether the server has closed its side (close_notify)
+    peer_closed: bool
+    random: String
+    session_id: String
+    key: String
+    transcript: String
+    master: String
+    c_hs: String
+    s_hs: String
+    c_ap: String
+    read: Keys
+    write: Keys
+    // bytes from the server not yet a whole record, and handshake bytes
+    // not yet a whole message
+    inbuf: String
+    hsbuf: String
+    // bytes for the server, and the server's application data, not yet taken
+    out: String
+    app: String
+    // the server's key, from its certificate
+    leaf_kind: x509.KeyKind
+    leaf_key: String
+    leaf_e: String
+    retried: bool
+    ccs_sent: bool
+    cert_requested: bool
+    cert_context: String
+}
+
+/// A client for `host`, with its randomness given: 32 bytes each for the
+/// ClientHello's random, its session id and the X25519 key.
+pub fn client(host: []u8, random: []u8, session_id: []u8, key: []u8) -> Client {
+    return Client{ .host = String.from(host), .state = START, .problem = String.new(), .alert_sent = 0, .chain = List(String).new(), .peer_closed = false, .random = String.from(random), .session_id = String.from(session_id), .key = String.from(key), .transcript = String.new(), .master = String.new(), .c_hs = String.new(), .s_hs = String.new(), .c_ap = String.new(), .read = no_keys(), .write = no_keys(), .inbuf = String.new(), .hsbuf = String.new(), .out = String.new(), .app = String.new(), .leaf_kind = x509.KeyKind.Other, .leaf_key = String.new(), .leaf_e = String.new(), .retried = false, .ccs_sent = false, .cert_requested = false, .cert_context = String.new() }
+}
+
+impl Client {
+    /// Starts the handshake: the ClientHello goes into the output.
+    pub fn start(self: *mut Self) {
+        if self.state != START {
+            return
+        }
+        if self.random.len != 32 or self.session_id.len != 32 or self.key.len != 32 {
+            self.state = CLOSED
+            self.problem = String.from("the handshake needs 96 random bytes")
+            return
+        }
+        let public = x25519.public_key(self.key)
+        let hello = client_hello(self.host, self.random, self.session_id, public[..], "")
+        self.transcript.append(hello)
+        // the first ClientHello's record may say 0x0301, for old middleboxes (5.1)
+        self.plain_record(HANDSHAKE, hello, 0x0301)
+        self.state = WAIT_SH
+    }
+
+    /// The bytes to send to the server now.
+    pub fn take_output(self: *mut Self) -> String {
+        let out = self.out.clone()
+        self.out.clear()
+        return out
+    }
+
+    /// The application data the server has sent, not yet taken.
+    pub fn take_app(self: *mut Self) -> String {
+        let app = self.app.clone()
+        self.app.clear()
+        return app
+    }
+
+    /// Takes bytes from the server: whole records are handled at once, the
+    /// rest kept for the next call.
+    pub fn feed(self: *mut Self, data: []u8) {
+        if self.state == START or self.state == CLOSED {
+            return
+        }
+        self.inbuf.append(data)
+        var at: usize = 0
+        while self.state != CLOSED and self.inbuf.len - at >= 5 {
+            let len = ((self.inbuf[at + 3] as usize) << 8) | (self.inbuf[at + 4] as usize)
+            if len > MAX_PLAINTEXT + 256 {
+                self.fail(RECORD_OVERFLOW, "the server sent a record longer than TLS allows")
+                return
+            }
+            if self.inbuf.len - at < 5 + len {
+                break
+            }
+            let header = String.from(self.inbuf[at..at + 5])
+            let body = String.from(self.inbuf[at + 5..at + 5 + len])
+            at += 5 + len
+            self.take_record(header, body)
+        }
+        if at > 0 and self.state != CLOSED {
+            let rest = String.from(self.inbuf[at..self.inbuf.len])
+            self.inbuf = rest
+        }
+    }
+
+    /// The caller found the server's chain good: the client's last flight
+    /// goes out, and the connection is open.
+    pub fn accept_chain(self: *mut Self) {
+        if self.state != CHECK_CHAIN {
+            return
+        }
+        if !self.ccs_sent {
+            self.plain_record(CCS, b"\x01", TLS12)
+            self.ccs_sent = true
+        }
+        if self.cert_requested {
+            // no certificate (4.4.2): the request's context, an empty list
+            var body = String.new()
+            body.push_byte(@truncate(u8, self.cert_context.len))
+            body.append(self.cert_context)
+            put24(&mut body, 0)
+            let m = message_of(CERTIFICATE, body)
+            self.transcript.append(m)
+            self.send_record(HANDSHAKE, m)
+        }
+        let fin = message_of(FINISHED, verify_data(self.c_hs, sha2.sha256(self.transcript)))
+        self.transcript.append(fin)
+        self.send_record(HANDSHAKE, fin)
+        self.write = keys_of(self.c_ap)
+        self.state = OPEN
+    }
+
+    /// The caller found the server's chain bad, for the reason given: the
+    /// connection fails with a bad_certificate alert.
+    pub fn reject_chain(self: *mut Self, why: []u8) {
+        if self.state == CHECK_CHAIN {
+            self.fail(BAD_CERTIFICATE, why)
+        }
+    }
+
+    /// Application data for the server; false when the connection is not
+    /// open.
+    pub fn send(self: *mut Self, data: []u8) -> bool {
+        if self.state != OPEN {
+            return false
+        }
+        self.send_record(APP_DATA, data)
+        return true
+    }
+
+    /// Closes this side with a close_notify alert.
+    pub fn close(self: *mut Self) {
+        if self.state == OPEN {
+            var body = String.new()
+            body.push_byte(1)
+            body.push_byte(CLOSE_NOTIFY)
+            self.send_record(ALERT, body)
+        }
+        self.state = CLOSED
+    }
+
+    /// The transport ended under the connection; `why` says how.
+    pub fn broken(self: *mut Self, why: []u8) {
+        if self.state != CLOSED {
+            self.state = CLOSED
+            if self.problem.len == 0 {
+                self.problem = String.from(why)
+            }
+        }
+    }
+
+    // ends the connection over a protocol failure: an alert for the
+    // server (protected once there are keys), and why for the program
+    fn fail(self: *mut Self, alert: u8, why: []u8) {
+        if self.state == CLOSED {
+            return
+        }
+        self.problem = String.from(why)
+        self.alert_sent = alert
+        var body = String.new()
+        body.push_byte(2)
+        body.push_byte(alert)
+        self.send_record(ALERT, body)
+        self.state = CLOSED
+    }
+
+    // unprotected records: the ClientHellos, the change_cipher_spec, an
+    // alert before there are keys
+    fn plain_record(self: *mut Self, kind: u8, data: []u8, version: usize) {
+        var at: usize = 0
+        while at < data.len {
+            let end = @min(at + MAX_PLAINTEXT, data.len)
+            self.out.push_byte(kind)
+            put16(&mut self.out, version)
+            put16(&mut self.out, end - at)
+            self.out.append(data[at..end])
+            at = end
+        }
+    }
+
+    // content for the server, protected once there are keys
+    fn send_record(self: *mut Self, kind: u8, data: []u8) {
+        if !self.write.on {
+            self.plain_record(kind, data, TLS12)
+            return
+        }
+        var at: usize = 0
+        while at < data.len {
+            let end = @min(at + MAX_PLAINTEXT, data.len)
+            let rec = seal_record(&mut self.write, kind, data[at..end])
+            self.out.append(rec)
+            at = end
+        }
+    }
+
+    fn take_record(self: *mut Self, header: []u8, body: []u8) {
+        let kind = header[0]
+        if kind == CCS {
+            // middlebox compatibility (5): one byte, 1, dropped; and only
+            // until the server's Finished
+            if self.state < WAIT_SH or self.state > WAIT_FINISHED or body.len != 1 or body[0] != 1 {
+                self.fail(UNEXPECTED_MESSAGE, "the server sent a change_cipher_spec record where none may be")
+            }
+            return
+        }
+        if self.read.on {
+            if kind != APP_DATA {
+                self.fail(UNEXPECTED_MESSAGE, "the server sent an unprotected record after keys were set")
+                return
+            }
+            let plain = open_record(&mut self.read, header, body) orelse {
+                self.fail(BAD_RECORD_MAC, "a record from the server did not authenticate")
+                return
+            }
+            if plain.data.len > MAX_PLAINTEXT {
+                self.fail(RECORD_OVERFLOW, "the server sent a record longer than TLS allows")
+                return
+            }
+            if plain.kind == 0 {
+                self.fail(UNEXPECTED_MESSAGE, "the server sent a record of nothing but padding")
+                return
+            }
+            self.content(plain.kind, plain.data)
+            return
+        }
+        if body.len > MAX_PLAINTEXT {
+            self.fail(RECORD_OVERFLOW, "the server sent a record longer than TLS allows")
+            return
+        }
+        if kind == HANDSHAKE or kind == ALERT {
+            self.content(kind, body)
+            return
+        }
+        self.fail(UNEXPECTED_MESSAGE, "the server sent a record nxtls could not read before the handshake")
+    }
+
+    fn content(self: *mut Self, kind: u8, data: []u8) {
+        if kind == ALERT {
+            self.alert(data)
+            return
+        }
+        if kind == HANDSHAKE {
+            if data.len == 0 {
+                self.fail(UNEXPECTED_MESSAGE, "the server sent an empty handshake record")
+                return
+            }
+            self.hsbuf.append(data)
+            self.messages()
+            return
+        }
+        // application data: after the server's Finished, and never in the
+        // middle of a handshake message (5.1)
+        if kind == APP_DATA and (self.state == CHECK_CHAIN or self.state == OPEN) and self.hsbuf.len == 0 {
+            if !self.peer_closed {
+                self.app.append(data)
+            }
+            return
+        }
+        self.fail(UNEXPECTED_MESSAGE, "the server sent a record where it may not")
+    }
+
+    fn alert(self: *mut Self, data: []u8) {
+        if data.len != 2 {
+            self.fail(DECODE_ERROR, "the server sent a malformed alert")
+            return
+        }
+        let desc = data[1]
+        if desc == CLOSE_NOTIFY {
+            self.peer_closed = true
+            if self.state != OPEN {
+                self.state = CLOSED
+                self.problem = String.from("the server closed the connection during the handshake")
+            }
+            return
+        }
+        if desc == USER_CANCELED {
+            // a close_notify follows
+            return
+        }
+        // every other alert is fatal in TLS 1.3 (6.2)
+        self.state = CLOSED
+        self.problem = format("the server ended the connection with alert {} ({})", .{desc, alert_name(desc)})
+    }
+
+    fn messages(self: *mut Self) {
+        while self.state != CLOSED and self.hsbuf.len >= 4 {
+            let len = ((self.hsbuf[1] as usize) << 16) | ((self.hsbuf[2] as usize) << 8) | (self.hsbuf[3] as usize)
+            if len > MAX_HANDSHAKE {
+                self.fail(DECODE_ERROR, "the server sent a handshake message too long to take")
+                return
+            }
+            if self.hsbuf.len < 4 + len {
+                return
+            }
+            let msg = String.from(self.hsbuf[0..4 + len])
+            let rest = String.from(self.hsbuf[4 + len..self.hsbuf.len])
+            self.hsbuf = rest
+            self.message(msg)
+        }
+    }
+
+    fn message(self: *mut Self, msg: []u8) {
+        let kind = msg[0]
+        let body = msg[4..msg.len]
+        let s = self.state
+        if s == WAIT_SH and kind == SERVER_HELLO {
+            self.server_hello(msg, body)
+        } else if s == WAIT_EE and kind == ENCRYPTED_EXTENSIONS {
+            self.encrypted_extensions(msg, body)
+        } else if s == WAIT_CERT_CR and kind == CERTIFICATE_REQUEST {
+            self.certificate_request(msg, body)
+        } else if (s == WAIT_CERT_CR or s == WAIT_CERT) and kind == CERTIFICATE {
+            self.certificate(msg, body)
+        } else if s == WAIT_CV and kind == CERTIFICATE_VERIFY {
+            self.certificate_verify(msg, body)
+        } else if s == WAIT_FINISHED and kind == FINISHED {
+            self.finished(msg, body)
+        } else if (s == CHECK_CHAIN or s == OPEN) and kind == NEW_SESSION_TICKET {
+            // no resumption, so a ticket is not kept
+        } else if s == OPEN and kind == KEY_UPDATE {
+            self.key_update(body)
+        } else {
+            let why = format("the server sent handshake message {} out of place", .{kind})
+            self.fail(UNEXPECTED_MESSAGE, why)
+        }
+    }
+
+    // after keys change, nothing of a handshake message may be left over (5.1)
+    fn boundary(self: *mut Self) {
+        if self.hsbuf.len > 0 {
+            self.fail(UNEXPECTED_MESSAGE, "a handshake message ran on past a change of keys")
+        }
+    }
+
+    fn server_hello(self: *mut Self, msg: []u8, b: []u8) {
+        let h = parse_hello(b) orelse {
+            self.fail(DECODE_ERROR, "the server's ServerHello is malformed")
+            return
+        }
+        if h.version == 0 {
+            // no supported_versions: the server chose TLS 1.2 or older
+            self.fail(PROTOCOL_VERSION, "the server does not speak TLS 1.3")
+            return
+        }
+        if h.version != TLS13 or h.legacy_version != TLS12 {
+            self.fail(ILLEGAL_PARAMETER, "the server chose a version nxtls did not offer")
+            return
+        }
+        if h.session_id != self.session_id {
+            self.fail(ILLEGAL_PARAMETER, "the server did not echo the session id")
+            return
+        }
+        if h.suite != SUITE or h.compression != 0 {
+            self.fail(ILLEGAL_PARAMETER, "the server chose a cipher suite nxtls did not offer")
+            return
+        }
+        if h.stray {
+            self.fail(UNSUPPORTED_EXTENSION, "the server's ServerHello has an extension nxtls did not ask for")
+            return
+        }
+        if h.random == HRR_RANDOM {
+            self.retry(msg, &h)
+            return
+        }
+        if h.group != GROUP_X25519 or h.share.len != 32 {
+            self.fail(ILLEGAL_PARAMETER, "the server's key share is not the X25519 one nxtls offered")
+            return
+        }
+        let shared = x25519.shared(self.key, h.share) catch {
+            self.fail(ILLEGAL_PARAMETER, "the server's X25519 key share is of small order")
+            return
+        }
+        self.transcript.append(msg)
+        let s = schedule(shared[..], sha2.sha256(self.transcript))
+        self.master = s.master.clone()
+        self.c_hs = s.c_hs.clone()
+        self.s_hs = s.s_hs.clone()
+        self.read = keys_of(s.s_hs)
+        self.write = keys_of(s.c_hs)
+        self.state = WAIT_EE
+        self.boundary()
+    }
+
+    // a HelloRetryRequest (4.1.4): the ClientHello again with the server's
+    // cookie, the transcript restarted from the first one's hash
+    fn retry(self: *mut Self, msg: []u8, h: *Hello) {
+        if self.retried {
+            self.fail(UNEXPECTED_MESSAGE, "the server sent a second HelloRetryRequest")
+            return
+        }
+        // nxtls offers X25519 alone and sent its share already, so asking
+        // for a group can only be wrong, and a request must change something
+        if h.group != 0 or h.cookie.len == 0 {
+            self.fail(ILLEGAL_PARAMETER, "the server's HelloRetryRequest asks for nothing nxtls can change")
+            return
+        }
+        self.retried = true
+        var restarted = String.new()
+        restarted.push_byte(MESSAGE_HASH)
+        put24(&mut restarted, 32)
+        restarted.append(sha2.sha256(self.transcript))
+        restarted.append(msg)
+        let public = x25519.public_key(self.key)
+        let hello = client_hello(self.host, self.random, self.session_id, public[..], h.cookie)
+        restarted.append(hello)
+        self.transcript = restarted
+        self.plain_record(CCS, b"\x01", TLS12)
+        self.ccs_sent = true
+        self.plain_record(HANDSHAKE, hello, TLS12)
+        self.boundary()
+    }
+
+    fn encrypted_extensions(self: *mut Self, msg: []u8, b: []u8) {
+        var at: usize = 0
+        let block = vec16(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's EncryptedExtensions is malformed")
+            return
+        }
+        let exts = extensions(block) orelse {
+            self.fail(DECODE_ERROR, "the server's EncryptedExtensions is malformed")
+            return
+        }
+        if at != b.len {
+            self.fail(DECODE_ERROR, "the server's EncryptedExtensions is malformed")
+            return
+        }
+        for e in exts {
+            // what may answer this ClientHello: server_name (empty) and the
+            // server's own groups
+            if e.kind == EXT_SERVER_NAME and e.data.len != 0 {
+                self.fail(DECODE_ERROR, "the server's EncryptedExtensions is malformed")
+                return
+            }
+            if e.kind != EXT_SERVER_NAME and e.kind != EXT_SUPPORTED_GROUPS {
+                self.fail(UNSUPPORTED_EXTENSION, "the server's EncryptedExtensions has an extension nxtls did not ask for")
+                return
+            }
+        }
+        self.transcript.append(msg)
+        self.state = WAIT_CERT_CR
+    }
+
+    // the server asks for a client certificate; there is none, and the
+    // client will say so (4.4.2)
+    fn certificate_request(self: *mut Self, msg: []u8, b: []u8) {
+        var at: usize = 0
+        let context = vec8(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's CertificateRequest is malformed")
+            return
+        }
+        let block = vec16(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's CertificateRequest is malformed")
+            return
+        }
+        if at != b.len or extensions(block) == null {
+            self.fail(DECODE_ERROR, "the server's CertificateRequest is malformed")
+            return
+        }
+        self.cert_requested = true
+        self.cert_context = String.from(context)
+        self.transcript.append(msg)
+        self.state = WAIT_CERT
+    }
+
+    fn certificate(self: *mut Self, msg: []u8, b: []u8) {
+        var at: usize = 0
+        let context = vec8(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's Certificate is malformed")
+            return
+        }
+        let list = vec24(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's Certificate is malformed")
+            return
+        }
+        if at != b.len {
+            self.fail(DECODE_ERROR, "the server's Certificate is malformed")
+            return
+        }
+        if context.len != 0 {
+            self.fail(ILLEGAL_PARAMETER, "the server's Certificate has a request context")
+            return
+        }
+        var p: usize = 0
+        while p < list.len {
+            let data = vec24(list, &mut p) orelse {
+                self.fail(DECODE_ERROR, "the server's Certificate is malformed")
+                return
+            }
+            let exts = vec16(list, &mut p) orelse {
+                self.fail(DECODE_ERROR, "the server's Certificate is malformed")
+                return
+            }
+            if data.len == 0 {
+                self.fail(DECODE_ERROR, "the server's Certificate is malformed")
+                return
+            }
+            // no status_request or signed_certificate_timestamp was asked for
+            if exts.len != 0 {
+                self.fail(UNSUPPORTED_EXTENSION, "the server's Certificate has extensions nxtls did not ask for")
+                return
+            }
+            self.chain.append(String.from(data))
+        }
+        if self.chain.len == 0 {
+            self.fail(DECODE_ERROR, "the server sent no certificate")
+            return
+        }
+        let leaf = x509.parse(self.chain[0]) orelse {
+            self.fail(BAD_CERTIFICATE, "the server's certificate is malformed")
+            return
+        }
+        self.leaf_kind = leaf.key_kind
+        self.leaf_key = leaf.key.clone()
+        self.leaf_e = leaf.rsa_e.clone()
+        self.transcript.append(msg)
+        self.state = WAIT_CV
+    }
+
+    fn certificate_verify(self: *mut Self, msg: []u8, b: []u8) {
+        var at: usize = 0
+        let scheme = get16(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's CertificateVerify is malformed")
+            return
+        }
+        let sig = vec16(b, &mut at) orelse {
+            self.fail(DECODE_ERROR, "the server's CertificateVerify is malformed")
+            return
+        }
+        if at != b.len {
+            self.fail(DECODE_ERROR, "the server's CertificateVerify is malformed")
+            return
+        }
+        // what the server signed (4.4.3): 64 spaces, the context string, a
+        // zero byte, the transcript's hash
+        var content = String.new()
+        for _ in 0..64 {
+            content.push_byte(0x20)
+        }
+        content.append("TLS 1.3, server CertificateVerify")
+        content.push_byte(0)
+        content.append(sha2.sha256(self.transcript))
+        let verdict = check_signature(scheme, self.leaf_kind, self.leaf_key, self.leaf_e, content, sig)
+        if verdict == 2 {
+            self.fail(ILLEGAL_PARAMETER, "the server signed with a scheme nxtls did not offer for its key")
+            return
+        }
+        if verdict == 1 {
+            self.fail(DECRYPT_ERROR, "the server's signature on the handshake does not verify")
+            return
+        }
+        self.transcript.append(msg)
+        self.state = WAIT_FINISHED
+    }
+
+    fn finished(self: *mut Self, msg: []u8, b: []u8) {
+        let want = verify_data(self.s_hs, sha2.sha256(self.transcript))
+        if !ct.eq(want, b) {
+            self.fail(DECRYPT_ERROR, "the server's Finished does not match the handshake")
+            return
+        }
+        self.transcript.append(msg)
+        let th = sha2.sha256(self.transcript)
+        self.c_ap = app_secret(self.master, "c ap traffic", th)
+        self.read = keys_of(app_secret(self.master, "s ap traffic", th))
+        self.state = CHECK_CHAIN
+        self.boundary()
+    }
+
+    // KeyUpdate (4.6.3): the server's keys move on, and this side's too
+    // when the server asks
+    fn key_update(self: *mut Self, b: []u8) {
+        if b.len != 1 {
+            self.fail(DECODE_ERROR, "the server's KeyUpdate is malformed")
+            return
+        }
+        if b[0] > 1 {
+            self.fail(ILLEGAL_PARAMETER, "the server's KeyUpdate asks for something that does not exist")
+            return
+        }
+        self.read = keys_of(expand(self.read.secret, "traffic upd", 32))
+        if b[0] == 1 {
+            var body = String.new()
+            body.push_byte(0)
+            self.send_record(HANDSHAKE, message_of(KEY_UPDATE, body))
+            self.write = keys_of(expand(self.write.secret, "traffic upd", 32))
+        }
+        self.boundary()
+    }
+}
+
+// ------------------------------------------------------------------ over TCP
+
+/// A TLS connection over TCP.
+pub struct Conn {
+    tcp: net.TcpStream
+    tls: Client
+    /// why the connection failed or was refused, when it was
+    problem: String
+}
+
+fn failed(why: []u8) -> Conn {
+    var tcp = net.TcpStream.from_socket(-1)
+    tcp.close()
+    var c = client("", "", "", "")
+    c.state = CLOSED
+    return Conn{ .tcp = tcp, .tls = c, .problem = String.from(why) }
+}
+
+/// A connection that is not open, to hold the place of one.
+pub fn none() -> Conn {
+    return failed("")
+}
+
+/// Connects to `host` at `port` and completes a TLS 1.3 handshake, with
+/// the server's chain checked against `roots` at `now` (ms since the
+/// epoch), each wait at most `timeout_ms`. The connection is open when it
+/// all worked; otherwise `problem` says what did not.
+pub fn connect(host: []u8, port: u16, roots: *x509.Store, now: i64, timeout_ms: i64) -> Conn {
+    let seed = entropy.bytes(96) catch {
+        return failed("no randomness for TLS: nxtls reads /dev/urandom, which this system does not have")
+    }
+    var tcp = net.TcpStream.connect_timeout(host, port, timeout_ms) catch |e| {
+        let why = format("could not connect to {}:{} ({})", .{host, port, @errorName(e)})
+        return failed(why)
+    }
+    tcp.set_timeout(timeout_ms)
+    var c = client(host, seed[0..32], seed[32..64], seed[64..96])
+    c.start()
+    while c.state != OPEN and c.state != CLOSED {
+        if c.state == CHECK_CHAIN {
+            if let why = x509.check_chain(&c.chain, host, now, roots) {
+                c.reject_chain(why)
+            } else {
+                c.accept_chain()
+            }
+            continue
+        }
+        let out = c.take_output()
+        if out.len > 0 {
+            tcp.send(out) catch |e| {
+                tcp.close()
+                let why = format("the TLS handshake with {} broke off ({})", .{host, @errorName(e)})
+                return failed(why)
+            }
+        }
+        let got = tcp.recv(65536) catch |e| {
+            tcp.close()
+            let why = format("the TLS handshake with {} broke off ({})", .{host, @errorName(e)})
+            return failed(why)
+        }
+        if got.len == 0 {
+            tcp.close()
+            let why = format("{} closed the connection during the TLS handshake", .{host})
+            return failed(why)
+        }
+        c.feed(got)
+    }
+    // the last flight, or the alert that ends it
+    let last = c.take_output()
+    if last.len > 0 {
+        tcp.send(last) catch {
+            c.broken("the connection broke as the handshake finished")
+        }
+    }
+    if c.state != OPEN {
+        tcp.close()
+        let why = format("TLS with {} failed: {}", .{host, c.problem})
+        return failed(why)
+    }
+    return Conn{ .tcp = tcp, .tls = c, .problem = String.new() }
+}
+
+impl Conn {
+    pub fn is_open(self: *Self) -> bool {
+        return self.tls.state == OPEN
+    }
+
+    /// How long `recv` waits for the server, in ms (0 waits forever).
+    pub fn set_timeout(self: *mut Self, ms: i64) {
+        self.tcp.set_timeout(ms)
+    }
+
+    // hands the client's output to the socket
+    fn flush(self: *mut Self) -> !void {
+        let out = self.tls.take_output()
+        if out.len > 0 {
+            self.tcp.send(out) catch |e| {
+                self.tls.broken("the connection broke while sending")
+                return e
+            }
+        }
+    }
+
+    fn note(self: *mut Self) {
+        if self.problem.len == 0 and self.tls.problem.len > 0 {
+            self.problem = self.tls.problem.clone()
+        }
+    }
+
+    /// Sends application data; error.Closed when the connection is not open.
+    pub fn send(self: *mut Self, data: []u8) -> !void {
+        if !self.tls.send(data) {
+            self.note()
+            return error.Closed
+        }
+        try self.flush()
+    }
+
+    /// The next application data from the server: at least one byte, or
+    /// "" once the server has closed its side. error.Timeout when nothing
+    /// came in time (call again: nothing is lost); error.Closed when the
+    /// connection failed, with `problem` saying why.
+    pub fn recv(self: *mut Self) -> !String {
+        while true {
+            if self.tls.app.len > 0 {
+                return self.tls.take_app()
+            }
+            if self.tls.peer_closed {
+                return String.new()
+            }
+            if self.tls.state != OPEN {
+                self.note()
+                return error.Closed
+            }
+            let got = try self.tcp.recv(65536)
+            if got.len == 0 {
+                // the TCP connection ended without close_notify: the end,
+                // for the caller, but not a clean one
+                self.tls.broken("the server dropped the connection without closing TLS")
+                self.note()
+                return String.new()
+            }
+            self.tls.feed(got)
+            // what the client owes the server now: a KeyUpdate, an alert
+            try self.flush()
+        }
+        return String.new()
+    }
+
+    /// Everything the server sends until it closes, at most `limit` bytes
+    /// (error.TooLong past that): the answer to a request sent with
+    /// Connection: close.
+    pub fn read_all(self: *mut Self, limit: usize) -> !String {
+        var out = String.new()
+        while true {
+            let got = try self.recv()
+            if got.len == 0 {
+                break
+            }
+            out.append(got)
+            if out.len > limit {
+                return error.TooLong
+            }
+        }
+        return out
+    }
+
+    /// Closes the connection, with close_notify when it is open.
+    pub fn close(self: *mut Self) {
+        if self.tls.state == OPEN {
+            self.tls.close()
+            self.flush() catch { }
+        }
+        self.tls.state = CLOSED
+        self.tcp.close()
+    }
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.fs
+import testvec
+
+test "the HelloRetryRequest random is SHA-256 of its name" {
+    expect(sha2.sha256("HelloRetryRequest") == HRR_RANDOM)
+}
+
+fn field(text: []u8, name: []u8) -> String {
+    for line in text.lines() {
+        let f = line.split(" ")
+        if f.len == 2 and f[0] == name {
+            return testvec.unhex(f[1])
+        }
+    }
+    println("tls: no {} in the vectors", .{name})
+    expect(false)
+    return String.new()
+}
+
+test "RFC 8448's simple handshake: the shared secret, the key schedule and both Finished" {
+    let text = fs.read("tests/vectors/tls13_rfc8448.txt") catch {
+        panic("tests/vectors/tls13_rfc8448.txt")
+    }
+    let shared = x25519.shared(field(text, "client_private"), field(text, "server_public")) catch {
+        panic("x25519")
+    }
+    expect(shared[..] == field(text, "shared"))
+    var transcript = field(text, "client_hello")
+    transcript.append(field(text, "server_hello"))
+    let s = schedule(shared[..], sha2.sha256(transcript))
+    expect(s.handshake == field(text, "handshake_secret"))
+    expect(s.c_hs == field(text, "c_hs"))
+    expect(s.s_hs == field(text, "s_hs"))
+    expect(s.master == field(text, "master"))
+    transcript.append(field(text, "encrypted_extensions"))
+    transcript.append(field(text, "certificate"))
+    transcript.append(field(text, "certificate_verify"))
+    let server_fin = field(text, "server_finished")
+    expect(verify_data(s.s_hs, sha2.sha256(transcript)) == server_fin[4..server_fin.len])
+    transcript.append(server_fin)
+    let th = sha2.sha256(transcript)
+    expect(app_secret(s.master, "c ap traffic", th) == field(text, "c_ap"))
+    expect(app_secret(s.master, "s ap traffic", th) == field(text, "s_ap"))
+    let client_fin = field(text, "client_finished")
+    expect(verify_data(s.c_hs, th) == client_fin[4..client_fin.len])
+}
+
+// n bytes of i % 251, as the vectors write long data
+fn pattern(n: usize) -> String {
+    var out = String.with_capacity(n)
+    for i in 0..n {
+        out.push_byte(@truncate(u8, i % 251))
+    }
+    return out
+}
+
+fn state_named(name: []u8) -> u8 {
+    if name == "open" {
+        return OPEN
+    }
+    if name == "check" {
+        return CHECK_CHAIN
+    }
+    if name == "closed" {
+        return CLOSED
+    }
+    expect_eq(name, "waiting")
+    return WAIT_SH
+}
+
+test "the vectors: whole exchanges with a server gen.py plays, byte for byte" {
+    let text = fs.read("tests/vectors/tls13.txt") catch {
+        panic("tests/vectors/tls13.txt")
+    }
+    var name = String.new()
+    var host = String.new()
+    var now: i64 = 0
+    var roots = x509.empty_store()
+    var c = client("", "", "", "")
+    var exchanges = 0
+    var step = 0
+    for line in text.lines() {
+        if !testvec.is_vector(line) {
+            continue
+        }
+        let f = line.split(" ")
+        step += 1
+        let at = format("tls exchange {} step {} ({})", .{name, step, f[0]})
+        if f[0] == "exchange" {
+            name = String.from(f[1])
+            roots = x509.empty_store()
+            step = 0
+        } else if f[0] == "client" {
+            host = String.from(f[1])
+            c = client(f[1], testvec.unhex(f[2]), testvec.unhex(f[3]), testvec.unhex(f[4]))
+            c.start()
+        } else if f[0] == "root" {
+            expect(roots.add(testvec.unhex(f[1])))
+        } else if f[0] == "now" {
+            now = f[1].parse_int(i64) catch 0
+        } else if f[0] == "expect" {
+            let got = c.take_output()
+            let want = testvec.unhex(f[1])
+            if got != want {
+                println("{}: the client sent {} bytes, not the {} expected; problem: {}", .{at, got.len, want.len, c.problem})
+            }
+            expect(got == want)
+        } else if f[0] == "feed" {
+            let data = testvec.unhex(f[2])
+            let size = testvec.number(f[1])
+            if size == 0 {
+                c.feed(data)
+            } else {
+                var i: usize = 0
+                while i < data.len {
+                    let end = @min(i + size, data.len)
+                    c.feed(data[i..end])
+                    i = end
+                }
+            }
+        } else if f[0] == "check" {
+            expect(c.state == CHECK_CHAIN)
+            if let why = x509.check_chain(&c.chain, host, now, &roots) {
+                c.reject_chain(why)
+            } else {
+                c.accept_chain()
+            }
+        } else if f[0] == "state" {
+            if c.state != state_named(f[1]) {
+                println("{}: state {}, problem: {}", .{at, c.state, c.problem})
+            }
+            expect(c.state == state_named(f[1]))
+        } else if f[0] == "alert" {
+            if c.alert_sent != (testvec.number(f[1]) as u8) {
+                println("{}: alert {} sent, problem: {}", .{at, c.alert_sent, c.problem})
+            }
+            expect(c.alert_sent == (testvec.number(f[1]) as u8))
+        } else if f[0] == "send" {
+            expect(c.send(testvec.unhex(f[1])))
+        } else if f[0] == "send_pattern" {
+            expect(c.send(pattern(testvec.number(f[1]))))
+        } else if f[0] == "app" {
+            let got = c.take_app()
+            expect(got == testvec.unhex(f[1]))
+        } else if f[0] == "app_pattern" {
+            let got = c.take_app()
+            expect(got == pattern(testvec.number(f[1])))
+        } else if f[0] == "peer_closed" {
+            expect(c.peer_closed)
+        } else if f[0] == "close" {
+            c.close()
+        } else if f[0] == "end" {
+            exchanges += 1
+        } else {
+            println("{}: an unknown step", .{at})
+            expect(false)
+        }
+    }
+    expect(exchanges >= 20)
+}
