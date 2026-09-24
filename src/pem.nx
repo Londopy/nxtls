@@ -1,0 +1,67 @@
+// pem.nx: PEM (RFC 7468), the text form certificates and CA bundles are
+// kept in.
+//
+// `import nxtls.pem` then:
+//
+//     for der in pem.decode_all(text, "CERTIFICATE") { ... }
+//
+// Lenient where RFC 7468 says a reader may be: text before, between and
+// after the blocks is ignored (Fedora's bundle puts a label above each), as
+// are carriage returns and blank lines. A block whose base64 does not
+// decode is skipped rather than ending the whole file.
+
+import std.bytes
+
+/// The decoded bodies of the `-----BEGIN <label>-----` blocks in `text`, in
+/// order.
+pub fn decode_all(text: []u8, label: []u8) -> List(String) {
+    let begin = format("-----BEGIN {}-----", .{label})
+    let end = format("-----END {}-----", .{label})
+    var out = List(String).new()
+    var inside = false
+    var body = String.new()
+    for raw in text.lines() {
+        let line = raw.trim()
+        if !inside {
+            if line == begin {
+                inside = true
+                body = String.new()
+            }
+            continue
+        }
+        if line == end {
+            inside = false
+            let der = bytes.unbase64(body) catch {
+                continue
+            }
+            if der.len > 0 {
+                out.append(der)
+            }
+            continue
+        }
+        if line.starts_with("-----") {
+            // another block began before this one ended: drop this one
+            inside = line == begin
+            body = String.new()
+            continue
+        }
+        body.append(line)
+    }
+    return out
+}
+
+// ------------------------------------------------------------------ tests
+
+test "blocks among other text, CRLF, labels and a broken block" {
+    let text = "Label: first\r\n-----BEGIN CERTIFICATE-----\r\nTWFu\r\n-----END CERTIFICATE-----\r\n\n# second\n-----BEGIN CERTIFICATE-----\naGVs\nbG8=\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\n*bad*\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nTWFu\n-----END PRIVATE KEY-----\n"
+    let got = decode_all(text, "CERTIFICATE")
+    expect_eq(got.len, 2)
+    expect_eq(got[0], "Man")
+    expect_eq(got[1], "hello")
+    expect_eq(decode_all(text, "PRIVATE KEY").len, 1)
+    // an unterminated block, and one cut short by the next
+    expect_eq(decode_all("-----BEGIN CERTIFICATE-----\nTWFu\n", "CERTIFICATE").len, 0)
+    let cut = decode_all("-----BEGIN CERTIFICATE-----\nTWFu\n-----BEGIN CERTIFICATE-----\naGVsbG8=\n-----END CERTIFICATE-----\n", "CERTIFICATE")
+    expect_eq(cut.len, 1)
+    expect_eq(cut[0], "hello")
+}

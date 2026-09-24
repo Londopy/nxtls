@@ -8,7 +8,8 @@ tests/vectors/ comes from Python's hashlib and hmac and from the
 `cryptography` package, which serve as the reference implementations
 the Nexium code has to agree with. Published values from the standards
 (FIPS 180-4, FIPS 186-5, RFC 4231, RFC 5869, RFC 6455, RFC 7748, RFC 8017,
-RFC 8032, RFC 8439, RFC 8448) are asserted along the way, so a mistake here cannot quietly become
+RFC 8032, RFC 8439, RFC 8448) are asserted along the way, and the chains in
+the X.509 vectors are judged by the reference's own path validation, so a mistake here cannot quietly become
 a "correct" answer. RFC 8439's vectors are in tools/rfc8439.py, extracted
 from the RFC's text rather than typed in.
 
@@ -17,11 +18,13 @@ from the RFC's text rather than typed in.
 """
 
 import base64
+import datetime
 import hashlib
 import hmac as pyhmac
 import os
 import random
 import sys
+import warnings
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -36,6 +39,8 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.poly1305 import Poly1305
 from cryptography.hazmat.primitives.asymmetric import ec, utils as asym_utils
 from cryptography.hazmat.primitives.asymmetric import padding as pypad, rsa as pyrsa
+from cryptography import x509 as pyx509
+from cryptography.x509 import verification as xv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidSignature
@@ -1016,6 +1021,525 @@ def rsa_vectors():
     return "\n".join(lines) + "\n"
 
 
+# ------------------------------------------------------------------ X.509
+
+UTC = datetime.timezone.utc
+
+
+def der_tlv(tag, body):
+    n = len(body)
+    if n < 0x80:
+        head = bytes([n])
+    else:
+        lb = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        head = bytes([0x80 | len(lb)]) + lb
+    return bytes([tag]) + head + body
+
+
+def der_seq(*items):
+    return der_tlv(0x30, b"".join(items))
+
+
+def der_set(*items):
+    return der_tlv(0x31, b"".join(items))
+
+
+def der_oid(dotted):
+    parts = [int(x) for x in dotted.split(".")]
+    body = bytes([40 * parts[0] + parts[1]])
+    for v in parts[2:]:
+        chunk = [v & 0x7F]
+        v >>= 7
+        while v:
+            chunk.append(0x80 | (v & 0x7F))
+            v >>= 7
+        body += bytes(reversed(chunk))
+    return der_tlv(0x06, body)
+
+
+def der_uint(v):
+    return der_tlv(0x02, v.to_bytes(v.bit_length() // 8 + 1, "big"))
+
+
+def der_bits(b, unused=0):
+    return der_tlv(0x03, bytes([unused]) + b)
+
+
+def der_time(dt):
+    if 1950 <= dt.year < 2050:
+        return der_tlv(0x17, dt.strftime("%y%m%d%H%M%SZ").encode())
+    return der_tlv(0x18, dt.strftime("%Y%m%d%H%M%SZ").encode())
+
+
+def der_name(cn, org="nxtls tests"):
+    return der_seq(der_set(der_seq(der_oid("2.5.4.6"), der_tlv(0x13, b"US"))),
+                   der_set(der_seq(der_oid("2.5.4.10"), der_tlv(0x0C, org.encode()))),
+                   der_set(der_seq(der_oid("2.5.4.3"), der_tlv(0x0C, cn.encode()))))
+
+
+def der_ext(dotted, value, critical=False):
+    flag = [der_tlv(0x01, b"\xff")] if critical else []
+    return der_seq(der_oid(dotted), *flag, der_tlv(0x04, value))
+
+
+KU_SIGN, KU_ENCIPHER, KU_CERT_SIGN, KU_CRL_SIGN = 0, 2, 5, 6
+SERVER_AUTH, CLIENT_AUTH = "1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"
+
+
+def ku_bits(*bits):
+    """KeyUsage as DER has it: bit 0 the first byte's top bit, no trailing
+    zero bits."""
+    top = max(bits)
+    b = bytearray(top // 8 + 1)
+    for i in bits:
+        b[i // 8] |= 0x80 >> (i % 8)
+    return der_bits(bytes(b), 8 * len(b) - (top + 1))
+
+
+def test_key(kind, bits=2048):
+    if kind == "rsa":
+        k = rsa_key(bits)
+        k["kind"] = "rsa"
+        k["point"] = der_seq(der_uint(k["n"]), der_uint(k["e"]))
+        k["spki"] = der_seq(der_seq(der_oid("1.2.840.113549.1.1.1"), der_tlv(0x05, b"")), der_bits(k["point"]))
+        return k
+    _, curve, c, size = EC_CURVES[0] if kind == "p256" else EC_CURVES[1]
+    d = int.from_bytes(rand_bytes(size + 8), "big") % (c["n"] - 1) + 1
+    point = ec.derive_private_key(d, curve).public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    curve_oid = "1.2.840.10045.3.1.7" if kind == "p256" else "1.3.132.0.34"
+    return {"kind": kind, "d": d, "curve": curve, "c": c, "size": size, "point": point,
+            "spki": der_seq(der_seq(der_oid("1.2.840.10045.2.1"), der_oid(curve_oid)), der_bits(point))}
+
+
+SIG_ALGS = {
+    "rsa-sha256": ("1.2.840.113549.1.1.11", "sha256"),
+    "rsa-sha384": ("1.2.840.113549.1.1.12", "sha384"),
+    "rsa-sha512": ("1.2.840.113549.1.1.13", "sha512"),
+    "rsa-sha1": ("1.2.840.113549.1.1.5", "sha1"),
+    "ecdsa-sha256": ("1.2.840.10045.4.3.2", "sha256"),
+    "ecdsa-sha384": ("1.2.840.10045.4.3.3", "sha384"),
+    "ecdsa-sha512": ("1.2.840.10045.4.3.4", "sha512"),
+}
+
+
+def alg_der(alg):
+    dotted, _ = SIG_ALGS[alg]
+    if alg.startswith("rsa"):
+        return der_seq(der_oid(dotted), der_tlv(0x05, b""))
+    return der_seq(der_oid(dotted))
+
+
+def sign_with(key, alg, message):
+    """Signatures that do not change from run to run: PKCS #1 v1.5 is
+    deterministic, and ECDSA's k comes from the seeded RNG."""
+    hname = SIG_ALGS[alg][1]
+    digest = hashlib.new(hname, message).digest()
+    if key["kind"] == "rsa":
+        if hname == "sha1":
+            return rsa_raw(key, pkcs1_encode(key["k"], None, digest, bytes.fromhex("3021300906052b0e03021a05000414")))
+        return rsa_raw(key, pkcs1_encode(key["k"], hname, digest))
+    k = int.from_bytes(rand_bytes(key["size"] + 8), "big") % (key["c"]["n"] - 1) + 1
+    r, sv = ec_sign(key["curve"], key["c"], key["size"], key["d"], digest, k)
+    return der_sig(r, sv)
+
+
+def ski_of(key):
+    return hashlib.sha1(key["point"]).digest()
+
+
+def profile(kind, key, issuer_key, names=(), pathlen=0, **over):
+    """The extensions of a root, a CA or a server's certificate as the web
+    has them; `over` replaces one by its name here, None leaves it out, and
+    new names are added at the end."""
+    e = {}
+    if kind == "root":
+        e["basic"] = der_ext("2.5.29.19", der_seq(der_tlv(0x01, b"\xff")), True)
+        e["ku"] = der_ext("2.5.29.15", ku_bits(KU_CERT_SIGN, KU_CRL_SIGN), True)
+        e["ski"] = der_ext("2.5.29.14", der_tlv(0x04, ski_of(key)))
+    elif kind == "ca":
+        body = der_tlv(0x01, b"\xff") + (b"" if pathlen is None else der_uint(pathlen))
+        e["basic"] = der_ext("2.5.29.19", der_tlv(0x30, body), True)
+        e["ku"] = der_ext("2.5.29.15", ku_bits(KU_SIGN, KU_CERT_SIGN, KU_CRL_SIGN), True)
+        e["eku"] = der_ext("2.5.29.37", der_seq(der_oid(SERVER_AUTH), der_oid(CLIENT_AUTH)))
+        e["ski"] = der_ext("2.5.29.14", der_tlv(0x04, ski_of(key)))
+        e["aki"] = der_ext("2.5.29.35", der_seq(der_tlv(0x80, ski_of(issuer_key))))
+    else:
+        e["ku"] = der_ext("2.5.29.15", ku_bits(KU_SIGN), True)
+        e["eku"] = der_ext("2.5.29.37", der_seq(der_oid(SERVER_AUTH)))
+        e["basic"] = der_ext("2.5.29.19", der_seq(), True)
+        e["ski"] = der_ext("2.5.29.14", der_tlv(0x04, ski_of(key)))
+        e["aki"] = der_ext("2.5.29.35", der_seq(der_tlv(0x80, ski_of(issuer_key))))
+        e["san"] = der_ext("2.5.29.17", der_seq(*[der_tlv(0x82, n.encode()) for n in names]))
+    for name, value in over.items():
+        if value is None:
+            e.pop(name, None)
+        else:
+            e[name] = value
+    return list(e.values())
+
+
+def make_cert(subject, key, issuer, issuer_key, exts, nb, na, alg=None, version=3, inner_alg=None,
+              times=None, tamper=False, serial=None, sig_unused=0):
+    alg = alg or {"rsa": "rsa-sha256", "p256": "ecdsa-sha256", "p384": "ecdsa-sha384"}[issuer_key["kind"]]
+    if serial is None:
+        serial = int.from_bytes(rand_bytes(16), "big") >> 1
+    items = [der_tlv(0xA0, der_uint(version - 1))] if version > 1 else []
+    validity = der_seq(*times) if times else der_seq(der_time(nb), der_time(na))
+    items += [der_uint(serial), alg_der(inner_alg or alg), der_name(issuer), validity, der_name(subject), key["spki"]]
+    if exts:
+        items.append(der_tlv(0xA3, der_seq(*exts)))
+    tbs = der_seq(*items)
+    sig = sign_with(issuer_key, alg, tbs)
+    if tamper:
+        sig = sig[:-1] + bytes([sig[-1] ^ 1])
+    return der_seq(tbs, alg_der(alg), der_bits(sig, sig_unused))
+
+
+def ms_of(dt):
+    return int(dt.timestamp()) * 1000
+
+
+def load_cert(der):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return pyx509.load_der_x509_certificate(der)
+
+
+def ref_well_formed(der):
+    """Whether the reference reads the certificate whole, extensions and key
+    included (it reads extensions only when asked)."""
+    try:
+        c = load_cert(der)
+        c.extensions
+        c.public_key()
+        c.not_valid_before_utc
+        c.not_valid_after_utc
+        c.subject
+        c.issuer
+        return True
+    except Exception:
+        return False
+
+
+def ref_info(der):
+    c = load_cert(der)
+    key = c.public_key()
+    if isinstance(key, pyrsa.RSAPublicKey):
+        kind = "rsa"
+    elif isinstance(key, ec.EllipticCurvePublicKey) and key.curve.name in ("secp256r1", "secp384r1"):
+        kind = "p256" if key.curve.name == "secp256r1" else "p384"
+    else:
+        kind = "other"
+    names = {d: n for n, (d, _) in SIG_ALGS.items() if n != "rsa-sha1"}
+    alg = names.get(c.signature_algorithm_oid.dotted_string, "other")
+    ca, path_len, usage, server, dns = "-", -1, -1, "-", []
+    for e in c.extensions:
+        v = e.value
+        if isinstance(v, pyx509.BasicConstraints):
+            ca = "1" if v.ca else "0"
+            path_len = -1 if v.path_length is None else v.path_length
+        elif isinstance(v, pyx509.KeyUsage):
+            flags = [v.digital_signature, v.content_commitment, v.key_encipherment, v.data_encipherment,
+                     v.key_agreement, v.key_cert_sign, v.crl_sign]
+            if v.key_agreement:
+                flags += [v.encipher_only, v.decipher_only]
+            usage = sum(1 << i for i, f in enumerate(flags) if f)
+        elif isinstance(v, pyx509.ExtendedKeyUsage):
+            ok = any(o.dotted_string in (SERVER_AUTH, "2.5.29.37.0") for o in v)
+            server = "1" if ok else "0"
+        elif isinstance(v, pyx509.SubjectAlternativeName):
+            dns = v.get_values_for_type(pyx509.DNSName)
+    version = 3 if c.version == pyx509.Version.v3 else 1
+    return "%d %d %d %s %s %s %d %d %s %s" % (
+        version, ms_of(c.not_valid_before_utc), ms_of(c.not_valid_after_utc), kind, alg, ca, path_len, usage,
+        server, ",".join(dns) if dns else "-")
+
+
+def ref_chain(certs, roots, chain, host, now):
+    """The reference's verdict: its path validation for a server (the CA/B
+    Forum's profile), with what it cannot read left out as nxtls leaves it."""
+    try:
+        store = xv.Store([load_cert(certs[r]) for r in roots])
+        leaf = load_cert(certs[chain[0]])
+    except Exception:
+        return False
+    extra = []
+    for n in chain[1:]:
+        try:
+            extra.append(load_cert(certs[n]))
+        except Exception:
+            pass
+    try:
+        verifier = xv.PolicyBuilder().store(store).time(now).build_server_verifier(xv.DNSName(host))
+        verifier.verify(leaf, extra)
+        return True
+    except Exception:
+        return False
+
+
+def x509_vectors():
+    certs = {}
+    cert_lines, info_lines, bad_lines, chain_lines = [], [], [], []
+
+    def cert(name, der):
+        certs[name] = der
+        cert_lines.append("cert %s %s" % (name, der.hex()))
+
+    def info(name):
+        info_lines.append("info %s %s" % (name, ref_info(certs[name])))
+
+    def malformed(what, der, strict=False):
+        what = what.replace(" ", "_") + ("_strict" if strict else "")
+        bad_lines.append("malformed %s %s" % (what, der.hex()))
+
+    def case(expect, host, now, roots, chain, what, mark=""):
+        what = what.replace(" ", "_") + ("_" + mark if mark else "")
+        chain_lines.append("chain %s %s %d %s %s %s" % (
+            expect, host, ms_of(now), ",".join(roots) or "-", ",".join(chain) or "-", what))
+
+    y = lambda year, month=1, day=1: datetime.datetime(year, month, day, tzinfo=UTC)  # noqa: E731
+    now = y(2026, 6)
+    root_t, ca_t, leaf_t = (y(2020), y(2040)), (y(2025), y(2030)), (y(2026, 3), y(2026, 9))
+
+    k_root, k_root_rsa, k_new = test_key("p384"), test_key("rsa"), test_key("p256")
+    k_int, k_int_rsa, k_int2 = test_key("p256"), test_key("rsa"), test_key("p256")
+    k_leaf, k_leaf384, k_leaf_rsa = test_key("p256"), test_key("p384"), test_key("rsa")
+    k_other, k_small = test_key("p256"), test_key("rsa", 1024)
+    names = ["example.com", "*.example.com"]
+
+    def root_cert(cn, key, t=root_t, **over):
+        return make_cert(cn, key, cn, key, profile("root", key, key, **over), *t)
+
+    def ca_cert(cn, key, issuer, issuer_key, t=ca_t, pathlen=0, **kw):
+        over = {k: v for k, v in kw.items() if k not in ("alg", "version")}
+        rest = {k: v for k, v in kw.items() if k in ("alg", "version")}
+        return make_cert(cn, key, issuer, issuer_key, profile("ca", key, issuer_key, pathlen=pathlen, **over), *t, **rest)
+
+    def leaf_cert(key, issuer, issuer_key, sans=names, t=leaf_t, cn="example.com", **kw):
+        over = {k: v for k, v in kw.items() if k not in ("alg", "version", "tamper", "inner_alg", "times", "sig_unused")}
+        rest = {k: v for k, v in kw.items() if k in ("alg", "version", "tamper", "inner_alg", "times", "sig_unused")}
+        return make_cert(cn, key, issuer, issuer_key, profile("leaf", key, issuer_key, sans, **over), *t, **rest)
+
+    cert("root", root_cert("Test Root EC", k_root))
+    cert("root-rsa", root_cert("Test Root RSA", k_root_rsa))
+    cert("root-old", root_cert("Test Root EC", k_root, t=(y(2010), y(2026))))
+    cert("int", ca_cert("Test CA EC", k_int, "Test Root EC", k_root))
+    cert("int-rsa", ca_cert("Test CA RSA", k_int_rsa, "Test Root RSA", k_root_rsa))
+    cert("leaf", leaf_cert(k_leaf, "Test CA EC", k_int))
+    for n in ["root", "root-rsa", "int", "int-rsa", "leaf"]:
+        info(n)
+    basic = ["leaf", "int"]
+    case("valid", "www.example.com", now, ["root"], basic, "EC chain")
+    case("valid", "example.com", now, ["root"], basic, "the bare name")
+    case("invalid", "a.b.example.com", now, ["root"], basic, "a wildcard over two labels")
+    case("invalid", "example.org", now, ["root"], basic, "another host")
+    case("invalid", "www.example.com", now, [], basic, "no roots")
+    case("invalid", "www.example.com", now, ["root"], ["leaf"], "the CA certificate not sent")
+    case("invalid", "www.example.com", now, ["root-rsa"], basic, "another root")
+    case("valid", "www.example.com", now, ["root"], ["leaf", "root-rsa", "int"], "out of order among others")
+    case("valid", "www.example.com", now, ["root"], ["leaf", "int", "root"], "the root sent too")
+    case("valid", "www.example.com", now, ["int"], ["leaf"], "a CA certificate as the trust anchor")
+    case("invalid", "www.example.com", y(2026, 2), ["root"], basic, "before the server's certificate")
+    case("invalid", "www.example.com", y(2026, 10), ["root"], basic, "after the server's certificate")
+    case("invalid", "www.example.com", now, ["root-old"], basic, "an expired root")
+    case("valid", "www.example.com", now, ["root-old", "root"], basic, "an expired root and its successor")
+
+    cert("int-old", ca_cert("Test CA EC", k_int, "Test Root EC", k_root, t=(y(2024), y(2026))))
+    case("invalid", "www.example.com", now, ["root"], ["leaf", "int-old"], "an expired CA")
+    cert("int-later", ca_cert("Test CA EC", k_int, "Test Root EC", k_root, t=(y(2026, 7), y(2030))))
+    case("invalid", "www.example.com", now, ["root"], ["leaf", "int-later"], "a CA not valid yet")
+
+    # algorithms
+    cert("leaf-under-rsa", leaf_cert(k_leaf, "Test CA RSA", k_int_rsa))
+    case("valid", "example.com", now, ["root-rsa"], ["leaf-under-rsa", "int-rsa"], "RSA root and CA")
+    cert("leaf-rsa", leaf_cert(k_leaf_rsa, "Test CA EC", k_int))
+    info("leaf-rsa")
+    case("valid", "example.com", now, ["root"], ["leaf-rsa", "int"], "an RSA server key")
+    cert("leaf-p384", leaf_cert(k_leaf384, "Test CA EC", k_int, alg="ecdsa-sha384"))
+    info("leaf-p384")
+    case("valid", "example.com", now, ["root"], ["leaf-p384", "int"], "a P-384 key, SHA-384 by a P-256 CA")
+    cert("leaf-sha512", leaf_cert(k_leaf, "Test CA EC", k_int, alg="ecdsa-sha512"))
+    case("valid", "example.com", now, ["root"], ["leaf-sha512", "int"], "ECDSA with SHA-512")
+    for alg in ["rsa-sha384", "rsa-sha512"]:
+        cert("leaf-" + alg, leaf_cert(k_leaf, "Test CA RSA", k_int_rsa, alg=alg))
+        info("leaf-" + alg)
+        case("valid", "example.com", now, ["root-rsa"], ["leaf-" + alg, "int-rsa"], alg)
+    cert("leaf-rsa-sha1", leaf_cert(k_leaf, "Test CA RSA", k_int_rsa, alg="rsa-sha1"))
+    case("invalid", "example.com", now, ["root-rsa"], ["leaf-rsa-sha1", "int-rsa"], "SHA-1")
+    cert("int-small", ca_cert("Test CA Small", k_small, "Test Root RSA", k_root_rsa))
+    cert("leaf-small", leaf_cert(k_leaf, "Test CA Small", k_small))
+    case("invalid", "example.com", now, ["root-rsa"], ["leaf-small", "int-small"], "a CA with a 1024-bit key")
+
+    # what makes a CA a CA
+    bad_cas = [
+        ("int-nobasic", {"basic": None}, "a CA without basicConstraints"),
+        ("int-notca", {"basic": der_ext("2.5.29.19", der_seq(), True)}, "a CA with cA false"),
+        ("int-ku", {"ku": der_ext("2.5.29.15", ku_bits(KU_SIGN), True)}, "a CA without keyCertSign"),
+        ("int-client", {"eku": der_ext("2.5.29.37", der_seq(der_oid(CLIENT_AUTH)))}, "a CA for clients only"),
+        ("int-critical", {"odd": der_ext("1.3.6.1.4.1.55555.1", der_tlv(0x05, b""), True)},
+         "a CA with an unknown critical extension"),
+    ]
+    for name, over, what in bad_cas:
+        cert(name, ca_cert("Test CA EC", k_int, "Test Root EC", k_root, **over))
+        case("invalid", "example.com", now, ["root"], ["leaf", name], what)
+    cert("int-noeku", ca_cert("Test CA EC", k_int, "Test Root EC", k_root, eku=None))
+    case("valid", "example.com", now, ["root"], ["leaf", "int-noeku"], "a CA without extendedKeyUsage")
+    cert("int-odd", ca_cert("Test CA EC", k_int, "Test Root EC", k_root,
+                            odd=der_ext("1.3.6.1.4.1.55555.1", der_tlv(0x05, b""))))
+    case("valid", "example.com", now, ["root"], ["leaf", "int-odd"], "a CA with an unknown extension, not critical")
+    permitted = der_seq(der_tlv(0xA0, der_seq(der_tlv(0x82, b"example.com"))))
+    cert("int-nc", ca_cert("Test CA EC", k_int, "Test Root EC", k_root, nc=der_ext("2.5.29.30", permitted, True)))
+    case("invalid", "example.com", now, ["root"], ["leaf", "int-nc"], "a CA with name constraints", "strict")
+    cert("int-v1", make_cert("Test CA EC", k_int, "Test Root EC", k_root, [], *ca_t, version=1))
+    info("int-v1")
+    case("invalid", "example.com", now, ["root"], ["leaf", "int-v1"], "a version 1 CA")
+
+    # path length
+    cert("int-top", ca_cert("Test CA Top", k_int2, "Test Root EC", k_root, pathlen=None))
+    cert("int-top0", ca_cert("Test CA Top", k_int2, "Test Root EC", k_root, pathlen=0))
+    cert("int-mid", ca_cert("Test CA EC", k_int, "Test CA Top", k_int2))
+    info("int-top")
+    case("valid", "example.com", now, ["root"], ["leaf", "int-mid", "int-top"], "two CAs")
+    case("invalid", "example.com", now, ["root"], ["leaf", "int-mid", "int-top0"], "two CAs under path length 0")
+
+    # the server's certificate
+    # (TLS 1.3 signs with the server's key, so RFC 8446 4.4.2.2 wants
+    # digitalSignature; the CA/B Forum wants serverAuth in every server
+    # certificate)
+    bad_leaves = [
+        ("leaf-ca", {"basic": der_ext("2.5.29.19", der_seq(der_tlv(0x01, b"\xff")), True)}, "a CA's certificate", ""),
+        ("leaf-ku", {"ku": der_ext("2.5.29.15", ku_bits(KU_ENCIPHER), True)}, "keyUsage without digitalSignature",
+         "strict"),
+        ("leaf-client", {"eku": der_ext("2.5.29.37", der_seq(der_oid(CLIENT_AUTH)))}, "for clients only", ""),
+        ("leaf-nosan", {"san": None}, "no subjectAltName", ""),
+        ("leaf-critical", {"odd": der_ext("1.3.6.1.4.1.55555.1", der_tlv(0x05, b""), True)},
+         "an unknown critical extension", ""),
+    ]
+    for name, over, what, mark in bad_leaves:
+        cert(name, leaf_cert(k_leaf, "Test CA EC", k_int, **over))
+        case("invalid", "example.com", now, ["root"], [name, "int"], what, mark)
+    cert("leaf-noeku", leaf_cert(k_leaf, "Test CA EC", k_int, eku=None))
+    case("invalid", "example.com", now, ["root"], ["leaf-noeku", "int"], "no extendedKeyUsage", "strict")
+    cert("leaf-noku", leaf_cert(k_leaf, "Test CA EC", k_int, ku=None))
+    case("valid", "example.com", now, ["root"], ["leaf-noku", "int"], "no keyUsage")
+    cert("leaf-odd", leaf_cert(k_leaf, "Test CA EC", k_int, odd=der_ext("1.3.6.1.4.1.55555.1", der_tlv(0x05, b""))))
+    case("valid", "example.com", now, ["root"], ["leaf-odd", "int"], "an unknown extension, not critical")
+    cert("leaf-badsig", leaf_cert(k_leaf, "Test CA EC", k_int, tamper=True))
+    case("invalid", "example.com", now, ["root"], ["leaf-badsig", "int"], "a bad signature")
+    cert("leaf-wrongkey", leaf_cert(k_leaf, "Test CA EC", k_other))
+    case("invalid", "example.com", now, ["root"], ["leaf-wrongkey", "int"], "signed by another key")
+    sans = ["WWW.Mixed.Example", "*.wild.example.com", "w*.part.example.com", "exact.example.net"]
+    cert("leaf-names", leaf_cert(k_leaf, "Test CA EC", k_int, sans=sans))
+    info("leaf-names")
+    for host, expect, what in [
+            ("www.mixed.example", "valid", "a name in capitals"),
+            ("a.wild.example.com", "valid", "a wildcard"),
+            ("wild.example.com", "invalid", "a wildcard's own domain"),
+            ("wpart.part.example.com", "invalid", "a partial wildcard"),
+            ("exact.example.net", "valid", "the last name")]:
+        case(expect, host, now, ["root"], ["leaf-names", "int"], what)
+    cert("leaf-tld", leaf_cert(k_leaf, "Test CA EC", k_int, sans=["*.com"]))
+    case("invalid", "example.com", now, ["root"], ["leaf-tld", "int"], "a wildcard over a top-level domain", "strict")
+
+    # a new root cross-signed by an old one, as ISRG's Root YR and Google's GTS Root R4 are
+    cert("root-new", root_cert("Test Root New", k_new))
+    cert("cross", ca_cert("Test Root New", k_new, "Test Root RSA", k_root_rsa, pathlen=None))
+    cert("cross-old", ca_cert("Test Root New", k_new, "Test Root RSA", k_root_rsa, pathlen=None, t=(y(2020), y(2026))))
+    cert("int-new", ca_cert("Test CA New", k_int2, "Test Root New", k_new))
+    cert("leaf-new", leaf_cert(k_leaf, "Test CA New", k_int2))
+    cross = ["leaf-new", "int-new", "cross"]
+    case("valid", "example.com", now, ["root-rsa"], cross, "cross-signed, the old root trusted")
+    case("valid", "example.com", now, ["root-new"], cross, "cross-signed, the new root trusted")
+    case("valid", "example.com", now, ["root-rsa", "root-new"], cross, "cross-signed, both trusted")
+    case("invalid", "example.com", now, ["root"], cross, "cross-signed, neither trusted")
+    case("valid", "example.com", now, ["root-new"], ["leaf-new", "int-new", "cross-old"],
+         "an expired cross-sign past a trusted root")
+    case("invalid", "example.com", now, ["root-rsa"], ["leaf-new", "int-new", "cross-old"],
+         "only an expired cross-sign")
+
+    # two CAs that sign each other, and no root: the search must end
+    cert("loop-x", ca_cert("Loop X", k_int, "Loop Y", k_int2, pathlen=None))
+    cert("loop-y", ca_cert("Loop Y", k_int2, "Loop X", k_int, pathlen=None))
+    cert("leaf-loop", leaf_cert(k_leaf, "Loop X", k_int))
+    case("invalid", "example.com", now, ["root"], ["leaf-loop", "loop-x", "loop-y"], "a loop")
+
+    # malformed certificates
+    good = certs["leaf"]
+    malformed("truncated", good[:-1])
+    malformed("a trailing byte", good + b"\x00")
+    assert good[1] == 0x82
+    malformed("a length not in its shortest form", b"\x30\x83\x00" + good[2:])
+    for what, nb in [("month 13", b"261301000000Z"), ("February 30", b"260230000000Z"),
+                     ("no Z", b"2603010000000"), ("hour 24", b"260301240000Z")]:
+        malformed(what, leaf_cert(k_leaf, "Test CA EC", k_int, times=(der_tlv(0x17, nb), der_time(leaf_t[1]))))
+    malformed("version 4", leaf_cert(k_leaf, "Test CA EC", k_int, version=4))
+    malformed("an inner algorithm unlike the outer", leaf_cert(k_leaf, "Test CA EC", k_int, inner_alg="ecdsa-sha384"),
+              strict=True)
+    malformed("an extension twice", leaf_cert(k_leaf, "Test CA EC", k_int,
+                                               san2=der_ext("2.5.29.17", der_seq(der_tlv(0x82, b"x.example.com")))))
+    malformed("a signature not whole bytes", leaf_cert(k_leaf, "Test CA EC", k_int, sig_unused=1), strict=True)
+    malformed("an empty subjectAltName", leaf_cert(k_leaf, "Test CA EC", k_int, sans=[]), strict=True)
+    malformed("extensions in version 1", make_cert("example.com", k_leaf, "Test CA EC", k_int,
+                                                   profile("leaf", k_leaf, k_int, names), *leaf_t, version=1),
+              strict=True)
+
+    # the captured chains, as of the day they were captured
+    real = datetime.datetime(2026, 9, 24, 8, tzinfo=UTC)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for host in ["discord.com", "gateway.discord.gg", "callook.info"]:
+            text = open(os.path.join(ROOT, "tests", "certs", host + ".pem"), "rb").read()
+            for i, c in enumerate(pyx509.load_pem_x509_certificates(text)):
+                cert("%s/%d" % (host, i), c.public_bytes(serialization.Encoding.DER))
+                info("%s/%d" % (host, i))
+        text = open(os.path.join(ROOT, "tests", "certs", "roots.pem"), "rb").read()
+        root_names = ["gts-r4", "isrg-x1", "isrg-x2", "godaddy-g2", "p521", "sha1"]
+        for name, c in zip(root_names, pyx509.load_pem_x509_certificates(text)):
+            cert("roots/" + name, c.public_bytes(serialization.Encoding.DER))
+            info("roots/" + name)
+    every = ["roots/" + n for n in root_names]
+    d3 = ["discord.com/0", "discord.com/1", "discord.com/2"]
+    g3 = ["gateway.discord.gg/0", "gateway.discord.gg/1", "gateway.discord.gg/2"]
+    c3 = ["callook.info/0", "callook.info/1", "callook.info/2"]
+    case("valid", "discord.com", real, ["roots/gts-r4"], d3, "discord.com")
+    case("valid", "www.discord.com", real, every, d3, "discord.com's wildcard")
+    case("invalid", "discord.gg", real, every, d3, "discord.com's chain for discord.gg")
+    case("invalid", "discord.com", datetime.datetime(2026, 12, 1, tzinfo=UTC), every, d3, "discord.com after it expires")
+    case("valid", "gateway.discord.gg", real, every, g3, "the Gateway")
+    case("valid", "discord.gg", real, ["roots/gts-r4"], g3, "discord.gg")
+    case("valid", "callook.info", real, ["roots/isrg-x1"], c3, "callook.info through the cross-signed Root YR")
+    case("valid", "www.callook.info", real, every, c3, "www.callook.info")
+    case("invalid", "callook.info", real, ["roots/gts-r4"], c3, "callook.info under another root")
+    case("invalid", "callook.info", real, every, c3[:2], "callook.info without the cross-sign")
+
+    # the reference agrees wherever the vectors do not say otherwise
+    wrong = []
+    for line in bad_lines:
+        f = line.split(" ")
+        if not f[1].endswith("_strict") and ref_well_formed(bytes.fromhex(f[2])):
+            wrong.append("the reference reads " + f[1])
+    for line in chain_lines:
+        f = line.split(" ")
+        if f[6].endswith("_strict") or f[6].endswith("_lenient"):
+            continue
+        at = datetime.datetime.fromtimestamp(int(f[3]) // 1000, UTC)
+        roots = [] if f[4] == "-" else f[4].split(",")
+        got = ref_chain(certs, roots, f[5].split(","), f[2], at)
+        if got != (f[1] == "valid"):
+            wrong.append("the reference disagrees on " + f[6])
+    assert not wrong, "\n".join(wrong)
+    head = ["# cert name der",
+            "# info name version not-before not-after key sig-alg ca path-len key-usage server-auth dns-names",
+            "#   (as the reference reads them; times in ms since the epoch; ca and server-auth 1, 0, or - for",
+            "#   no such extension; -1 for no path length or key usage)",
+            "# malformed what der",
+            "# chain expect host now roots certs what (the server's certificate first; - for none)",
+            "# nxtls refuses what the reference accepts where marked strict, and accepts what it refuses",
+            "# where marked lenient"]
+    return "\n".join(head + cert_lines + info_lines + bad_lines + chain_lines) + "\n"
+
+
 # ------------------------------------------------------------------ main
 
 OUTPUTS = {
@@ -1032,6 +1556,7 @@ OUTPUTS = {
     "tests/vectors/chacha20poly1305.txt": aead_vectors,
     "tests/vectors/ecdsa.txt": ecdsa_vectors,
     "tests/vectors/rsa.txt": rsa_vectors,
+    "tests/vectors/x509.txt": x509_vectors,
 }
 
 

@@ -1,0 +1,1043 @@
+// x509.nx: X.509 certificates (RFC 5280) as TLS servers present them:
+// reading one, and checking a server's chain against trusted roots for a
+// host name.
+//
+// `import nxtls.x509` then:
+//
+//     let roots = x509.store_from_pem(bundle)       // e.g. /etc/ssl/certs/ca-certificates.crt
+//     let problem = x509.check_chain(&chain, "discord.com", time.now(), &roots)
+//     if problem != null { ... refuse the connection, saying why ... }
+//
+// The chain is the certificates as the server sent them: its own first,
+// then any others, in any order (TLS 1.3 allows that). The path is built
+// the way browsers build it: up from the server's certificate, taking a
+// trusted root whenever one issued the certificate in hand, otherwise
+// trying each certificate the server sent that names the issuer, so a
+// cross-signed CA works whichever of its roots the store has.
+//
+// What is checked, as browsers check a server:
+// - every signature on the path: RSA PKCS #1 v1.5, or ECDSA on P-256 or
+//   P-384, with SHA-256, SHA-384 or SHA-512 (no SHA-1);
+// - every certificate's validity period, at `now`;
+// - each CA: version 3, marked a CA (basicConstraints), allowed to sign
+//   certificates (keyUsage) and to issue server certificates
+//   (extendedKeyUsage), and allowing as many CAs below it as there are
+//   (pathLenConstraint);
+// - the server's certificate: version 3, for `host` (subjectAltName DNS
+//   names; a wildcard only as the whole first label, standing for one
+//   label, with at least two labels after it), for servers
+//   (extendedKeyUsage serverAuth, which it must have), allowed to sign
+//   (keyUsage), and not a CA's;
+// - no certificate on the path has a critical extension nxtls does not
+//   know.
+//
+// Not checked: revocation (no OCSP, no CRLs); and name constraints: a CA
+// that has them is refused rather than trusted without them. A root is
+// trusted for its name and key, within its validity period (as Go and
+// Python's cryptography have it; an expired root sends the search on to
+// another path); nothing else in it is checked.
+//
+// Parsing is strict DER (der.nx) except where real roots need otherwise: a
+// serial number may be zero or negative, and a key or signature algorithm
+// nxtls cannot use still parses (KeyKind.Other, SigAlg.Other), so a CA
+// bundle loads whole. Everything here is public data: ordinary code.
+
+import std.time
+import der
+import ecdsa
+import pem
+import rsa
+import sha2
+
+pub enum KeyKind {
+    Rsa,
+    P256,
+    P384,
+    /// a key nxtls cannot use: another algorithm or curve
+    Other,
+}
+
+pub enum SigAlg {
+    RsaSha256,
+    RsaSha384,
+    RsaSha512,
+    EcdsaSha256,
+    EcdsaSha384,
+    EcdsaSha512,
+    /// one nxtls cannot check, SHA-1's among them
+    Other,
+}
+
+/// A certificate, read: what the checks need, the rest skipped.
+pub struct Cert {
+    /// the whole certificate, DER
+    der: String
+    /// 1, 2 or 3
+    version: u8
+    /// the signed part (TBSCertificate), as offsets into `der`
+    tbs_start: usize
+    tbs_end: usize
+    sig_alg: SigAlg
+    /// the signature (the BIT STRING's bytes after its unused-bits count)
+    signature: String
+    /// the names, DER; chaining compares them byte for byte, as the CA/B
+    /// Forum's rules for issuers make safe
+    issuer: String
+    subject: String
+    /// the validity period, ms since the epoch
+    not_before: i64
+    not_after: i64
+    key_kind: KeyKind
+    /// RSA: the modulus, big-endian; EC: the point (0x04, x, y)
+    key: String
+    /// RSA: the public exponent
+    rsa_e: String
+    /// basicConstraints: whether present, cA, and pathLenConstraint (-1
+    /// when absent)
+    has_basic: bool
+    is_ca: bool
+    path_len: i64
+    /// keyUsage's bits (bit 0 digitalSignature, bit 5 keyCertSign); -1 when
+    /// absent
+    key_usage: i64
+    /// extendedKeyUsage: whether present, and whether it allows serverAuth
+    has_eku: bool
+    server_auth: bool
+    /// subjectAltName: whether present, and its DNS names
+    has_san: bool
+    dns_names: List(String)
+    /// whether nameConstraints is present
+    constrained: bool
+    /// whether a critical extension nxtls does not know is present
+    unknown_critical: bool
+}
+
+// object identifiers, as their DER bodies
+const OID_RSA: []u8 = b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+const OID_RSA_SHA256: []u8 = b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"
+const OID_RSA_SHA384: []u8 = b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c"
+const OID_RSA_SHA512: []u8 = b"\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d"
+const OID_EC: []u8 = b"\x2a\x86\x48\xce\x3d\x02\x01"
+const OID_P256: []u8 = b"\x2a\x86\x48\xce\x3d\x03\x01\x07"
+const OID_P384: []u8 = b"\x2b\x81\x04\x00\x22"
+const OID_ECDSA_SHA256: []u8 = b"\x2a\x86\x48\xce\x3d\x04\x03\x02"
+const OID_ECDSA_SHA384: []u8 = b"\x2a\x86\x48\xce\x3d\x04\x03\x03"
+const OID_ECDSA_SHA512: []u8 = b"\x2a\x86\x48\xce\x3d\x04\x03\x04"
+const OID_CN: []u8 = b"\x55\x04\x03"
+const OID_SKI: []u8 = b"\x55\x1d\x0e"
+const OID_KEY_USAGE: []u8 = b"\x55\x1d\x0f"
+const OID_SAN: []u8 = b"\x55\x1d\x11"
+const OID_BASIC: []u8 = b"\x55\x1d\x13"
+const OID_NAME_CONSTRAINTS: []u8 = b"\x55\x1d\x1e"
+const OID_POLICIES: []u8 = b"\x55\x1d\x20"
+const OID_AKI: []u8 = b"\x55\x1d\x23"
+const OID_EKU: []u8 = b"\x55\x1d\x25"
+const OID_ANY_EKU: []u8 = b"\x55\x1d\x25\x00"
+const OID_SERVER_AUTH: []u8 = b"\x2b\x06\x01\x05\x05\x07\x03\x01"
+
+// ------------------------------------------------------------------ reading
+
+fn blank(b: []u8) -> Cert {
+    return Cert{ .der = String.from(b), .version = 1, .tbs_start = 0, .tbs_end = 0, .sig_alg = SigAlg.Other, .signature = String.new(), .issuer = String.new(), .subject = String.new(), .not_before = 0, .not_after = 0, .key_kind = KeyKind.Other, .key = String.new(), .rsa_e = String.new(), .has_basic = false, .is_ca = false, .path_len = -1, .key_usage = -1, .has_eku = false, .server_auth = false, .has_san = false, .dns_names = List(String).new(), .constrained = false, .unknown_critical = false }
+}
+
+/// A certificate from its DER; null when that is malformed or has bytes
+/// after it.
+pub fn parse(b: []u8) -> ?Cert {
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue BIT STRING }
+    let outer = der.expect_tag(b, 0, b.len, 0x30) orelse return null
+    if outer.end != b.len {
+        return null
+    }
+    let tbs = der.expect_tag(b, outer.body, outer.end, 0x30) orelse return null
+    let alg = der.expect_tag(b, tbs.end, outer.end, 0x30) orelse return null
+    let sig = der.expect_tag(b, alg.end, outer.end, 0x03) orelse return null
+    // a signature is whole bytes
+    if sig.end != outer.end or sig.end - sig.body < 2 or b[sig.body] != 0 {
+        return null
+    }
+    var c = blank(b)
+    c.tbs_start = tbs.start
+    c.tbs_end = tbs.end
+    c.sig_alg = sig_alg_of(b, alg)
+    c.signature = String.from(b[sig.body + 1..sig.end])
+    if !read_tbs(b, tbs, alg, &mut c) {
+        return null
+    }
+    return c
+}
+
+fn read_tbs(b: []u8, tbs: der.Tlv, alg: der.Tlv, c: *mut Cert) -> bool {
+    var at = tbs.body
+    let first = der.read(b, at, tbs.end) orelse return false
+    if first.tag == 0xa0 {
+        // version [0] EXPLICIT: v2 or v3 (v1 is left out, as DER says)
+        let v = der.expect_tag(b, first.body, first.end, 0x02) orelse return false
+        if v.end != first.end or v.end - v.body != 1 or b[v.body] < 1 or b[v.body] > 2 {
+            return false
+        }
+        c.version = b[v.body] + 1
+        at = first.end
+    }
+    // the serial number: any INTEGER (a few roots have serial zero)
+    let serial = der.expect_tag(b, at, tbs.end, 0x02) orelse return false
+    if serial.end == serial.body {
+        return false
+    }
+    // the signature algorithm again, which must be the one outside
+    let inner = der.expect_tag(b, serial.end, tbs.end, 0x30) orelse return false
+    if b[inner.start..inner.end] != b[alg.start..alg.end] {
+        return false
+    }
+    let issuer = der.expect_tag(b, inner.end, tbs.end, 0x30) orelse return false
+    let validity = der.expect_tag(b, issuer.end, tbs.end, 0x30) orelse return false
+    let nb = der.read(b, validity.body, validity.end) orelse return false
+    let na = der.read(b, nb.end, validity.end) orelse return false
+    if na.end != validity.end {
+        return false
+    }
+    c.not_before = time_of(b, nb) orelse return false
+    c.not_after = time_of(b, na) orelse return false
+    let subject = der.expect_tag(b, validity.end, tbs.end, 0x30) orelse return false
+    let spki = der.expect_tag(b, subject.end, tbs.end, 0x30) orelse return false
+    c.issuer = String.from(b[issuer.start..issuer.end])
+    c.subject = String.from(b[subject.start..subject.end])
+    if !read_key(b, spki, c) {
+        return false
+    }
+    // issuerUniqueID [1], subjectUniqueID [2], extensions [3]: optional, in
+    // that order, and none of them in a v1 certificate
+    at = spki.end
+    var last: u8 = 0
+    while at < tbs.end {
+        let t = der.read(b, at, tbs.end) orelse return false
+        let n = t.tag & 0x1f
+        if (t.tag & 0xc0) != 0x80 or n <= last or n > 3 or c.version == 1 {
+            return false
+        }
+        if n == 3 and (c.version != 3 or !read_extensions(b, t, c)) {
+            return false
+        }
+        last = n
+        at = t.end
+    }
+    return true
+}
+
+fn sig_alg_of(b: []u8, alg: der.Tlv) -> SigAlg {
+    let id = der.expect_tag(b, alg.body, alg.end, 0x06) orelse return SigAlg.Other
+    let oid = b[id.body..id.end]
+    let params = b[id.end..alg.end]
+    // RSA's parameters are NULL (RFC 4055; a few leave them out), ECDSA's
+    // absent (RFC 5758)
+    if params == b"\x05\x00" or params.len == 0 {
+        if oid == OID_RSA_SHA256 {
+            return SigAlg.RsaSha256
+        }
+        if oid == OID_RSA_SHA384 {
+            return SigAlg.RsaSha384
+        }
+        if oid == OID_RSA_SHA512 {
+            return SigAlg.RsaSha512
+        }
+    }
+    if params.len == 0 {
+        if oid == OID_ECDSA_SHA256 {
+            return SigAlg.EcdsaSha256
+        }
+        if oid == OID_ECDSA_SHA384 {
+            return SigAlg.EcdsaSha384
+        }
+        if oid == OID_ECDSA_SHA512 {
+            return SigAlg.EcdsaSha512
+        }
+    }
+    return SigAlg.Other
+}
+
+// SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+fn read_key(b: []u8, spki: der.Tlv, c: *mut Cert) -> bool {
+    let alg = der.expect_tag(b, spki.body, spki.end, 0x30) orelse return false
+    let id = der.expect_tag(b, alg.body, alg.end, 0x06) orelse return false
+    let bits = der.expect_tag(b, alg.end, spki.end, 0x03) orelse return false
+    if bits.end != spki.end or bits.end == bits.body {
+        return false
+    }
+    if b[bits.body] != 0 {
+        // not whole bytes: not a key nxtls can use
+        return true
+    }
+    let oid = b[id.body..id.end]
+    let key = b[bits.body + 1..bits.end]
+    if oid == OID_RSA {
+        let params = b[id.end..alg.end]
+        if params != b"\x05\x00" and params.len != 0 {
+            return true
+        }
+        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+        let seq = der.expect_tag(key, 0, key.len, 0x30) orelse return false
+        let n = der.expect_tag(key, seq.body, seq.end, 0x02) orelse return false
+        let e = der.expect_tag(key, n.end, seq.end, 0x02) orelse return false
+        if seq.end != key.len or e.end != seq.end {
+            return false
+        }
+        let nv = der.positive(key, n) orelse return false
+        let ev = der.positive(key, e) orelse return false
+        c.key_kind = KeyKind.Rsa
+        c.key = String.from(nv)
+        c.rsa_e = String.from(ev)
+        return true
+    }
+    if oid == OID_EC {
+        // the curve by name (RFC 5480), and the point uncompressed
+        let curve = der.expect_tag(b, id.end, alg.end, 0x06) orelse return true
+        if curve.end != alg.end or key.len == 0 or key[0] != 4 {
+            return true
+        }
+        let name = b[curve.body..curve.end]
+        if name == OID_P256 and key.len == 65 {
+            c.key_kind = KeyKind.P256
+            c.key = String.from(key)
+        } else if name == OID_P384 and key.len == 97 {
+            c.key_kind = KeyKind.P384
+            c.key = String.from(key)
+        }
+    }
+    return true
+}
+
+fn digits(s: []u8, at: usize, n: usize) -> ?i64 {
+    var v: i64 = 0
+    for i in at..at + n {
+        let ch = s[i]
+        if ch < '0' or ch > '9' {
+            return null
+        }
+        v = v * 10 + ((ch - '0') as i64)
+    }
+    return v
+}
+
+// a UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ), as RFC
+// 5280 allows them, in ms since the epoch
+fn time_of(b: []u8, t: der.Tlv) -> ?i64 {
+    let s = b[t.body..t.end]
+    var year: i64 = 0
+    var at: usize = 0
+    if t.tag == 0x17 and s.len == 13 {
+        let yy = digits(s, 0, 2) orelse return null
+        year = if yy >= 50 { 1900 + yy } else { 2000 + yy }
+        at = 2
+    } else if t.tag == 0x18 and s.len == 15 {
+        year = digits(s, 0, 4) orelse return null
+        at = 4
+    } else {
+        return null
+    }
+    if s[s.len - 1] != 'Z' {
+        return null
+    }
+    let month = digits(s, at, 2) orelse return null
+    let day = digits(s, at + 2, 2) orelse return null
+    let hour = digits(s, at + 4, 2) orelse return null
+    let minute = digits(s, at + 6, 2) orelse return null
+    let second = digits(s, at + 8, 2) orelse return null
+    if month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59 {
+        return null
+    }
+    if day > (time.days_in_month(year as i32, month as u8) as i64) {
+        return null
+    }
+    let d = time.DateTime{ .year = year as i32, .month = month as u8, .day = day as u8, .hour = hour as u8, .minute = minute as u8, .second = second as u8, .millis = 0, .offset_min = 0 }
+    return d.to_ms()
+}
+
+// Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension
+// Extension ::= SEQUENCE { extnID OBJECT IDENTIFIER, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }
+fn read_extensions(b: []u8, t: der.Tlv, c: *mut Cert) -> bool {
+    let list = der.expect_tag(b, t.body, t.end, 0x30) orelse return false
+    if list.end != t.end or list.body == list.end {
+        return false
+    }
+    var seen = List(String).new()
+    var at = list.body
+    while at < list.end {
+        let ext = der.expect_tag(b, at, list.end, 0x30) orelse return false
+        let id = der.expect_tag(b, ext.body, ext.end, 0x06) orelse return false
+        var next = id.end
+        var critical = false
+        let flag = der.read(b, next, ext.end) orelse return false
+        if flag.tag == 0x01 {
+            if flag.end - flag.body != 1 {
+                return false
+            }
+            critical = b[flag.body] != 0
+            next = flag.end
+        }
+        let value = der.expect_tag(b, next, ext.end, 0x04) orelse return false
+        if value.end != ext.end {
+            return false
+        }
+        let oid = b[id.body..id.end]
+        // each extension at most once (RFC 5280 4.2)
+        for s in seen {
+            if s == oid {
+                return false
+            }
+        }
+        seen.append(String.from(oid))
+        let v = b[value.body..value.end]
+        var ok = true
+        if oid == OID_BASIC {
+            ok = basic_constraints(v, c)
+        } else if oid == OID_KEY_USAGE {
+            ok = key_usage(v, c)
+        } else if oid == OID_EKU {
+            ok = ext_key_usage(v, c)
+        } else if oid == OID_SAN {
+            ok = alt_names(v, c)
+        } else if oid == OID_NAME_CONSTRAINTS {
+            c.constrained = true
+        } else if critical and oid != OID_SKI and oid != OID_AKI and oid != OID_POLICIES {
+            c.unknown_critical = true
+        }
+        if !ok {
+            return false
+        }
+        at = ext.end
+    }
+    return true
+}
+
+// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL }
+fn basic_constraints(v: []u8, c: *mut Cert) -> bool {
+    let seq = der.expect_tag(v, 0, v.len, 0x30) orelse return false
+    if seq.end != v.len {
+        return false
+    }
+    c.has_basic = true
+    var at = seq.body
+    if at < seq.end {
+        let t = der.read(v, at, seq.end) orelse return false
+        if t.tag == 0x01 {
+            if t.end - t.body != 1 {
+                return false
+            }
+            c.is_ca = v[t.body] != 0
+            at = t.end
+        }
+    }
+    if at < seq.end {
+        let t = der.expect_tag(v, at, seq.end, 0x02) orelse return false
+        let n = der.positive(v, t) orelse return false
+        if n.len > 4 {
+            return false
+        }
+        var len: i64 = 0
+        for x in n {
+            len = len * 256 + (x as i64)
+        }
+        c.path_len = len
+        at = t.end
+    }
+    return at == seq.end
+}
+
+// KeyUsage ::= BIT STRING, bit 0 (digitalSignature) the first byte's top bit
+fn key_usage(v: []u8, c: *mut Cert) -> bool {
+    let t = der.expect_tag(v, 0, v.len, 0x03) orelse return false
+    if t.end != v.len or t.end - t.body < 2 or v[t.body] > 7 {
+        return false
+    }
+    var bits: i64 = 0
+    var i: usize = 0
+    while i < 2 and t.body + 1 + i < t.end {
+        let byte = v[t.body + 1 + i] as i64
+        var k: i64 = 0
+        while k < 8 {
+            if ((byte >> (7 - k)) & 1) == 1 {
+                bits |= (1 as i64) << (8 * (i as i64) + k)
+            }
+            k += 1
+        }
+        i += 1
+    }
+    c.key_usage = bits
+    return true
+}
+
+// ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId
+fn ext_key_usage(v: []u8, c: *mut Cert) -> bool {
+    let seq = der.expect_tag(v, 0, v.len, 0x30) orelse return false
+    if seq.end != v.len or seq.body == seq.end {
+        return false
+    }
+    c.has_eku = true
+    var at = seq.body
+    while at < seq.end {
+        let id = der.expect_tag(v, at, seq.end, 0x06) orelse return false
+        let oid = v[id.body..id.end]
+        if oid == OID_SERVER_AUTH or oid == OID_ANY_EKU {
+            c.server_auth = true
+        }
+        at = id.end
+    }
+    return true
+}
+
+// GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName; dNSName is
+// [2] IA5String. A DNS name with a byte no host name has is left out.
+fn alt_names(v: []u8, c: *mut Cert) -> bool {
+    let seq = der.expect_tag(v, 0, v.len, 0x30) orelse return false
+    if seq.end != v.len or seq.body == seq.end {
+        return false
+    }
+    c.has_san = true
+    var at = seq.body
+    while at < seq.end {
+        let t = der.read(v, at, seq.end) orelse return false
+        if t.tag == 0x82 {
+            let name = v[t.body..t.end]
+            var plain = name.len > 0
+            for ch in name {
+                if ch <= 0x20 or ch >= 0x7f {
+                    plain = false
+                }
+            }
+            if plain {
+                c.dns_names.append(String.from(name))
+            }
+        }
+        at = t.end
+    }
+    return true
+}
+
+/// The common name in a DER Name, for messages.
+pub fn name_text(name: []u8) -> String {
+    // Name ::= SEQUENCE OF SET OF SEQUENCE { type OBJECT IDENTIFIER, value ANY }
+    let seq = der.expect_tag(name, 0, name.len, 0x30) orelse return String.from("(a malformed name)")
+    var cn = String.new()
+    var at = seq.body
+    while at < seq.end {
+        let set = der.expect_tag(name, at, seq.end, 0x31) orelse break
+        var i = set.body
+        while i < set.end {
+            let atv = der.expect_tag(name, i, set.end, 0x30) orelse break
+            let id = der.expect_tag(name, atv.body, atv.end, 0x06) orelse break
+            let v = der.read(name, id.end, atv.end) orelse break
+            if name[id.body..id.end] == OID_CN {
+                cn = String.from(name[v.body..v.end])
+            }
+            i = atv.end
+        }
+        at = set.end
+    }
+    if cn.len == 0 {
+        return String.from("(a certificate with no common name)")
+    }
+    return cn
+}
+
+// ------------------------------------------------------------------ host names
+
+/// Whether a certificate's DNS name (perhaps a wildcard, *.example.com)
+/// covers `host`. Letters compare without regard to case; a wildcard is
+/// the whole first label, stands for exactly one label, and needs at least
+/// two labels after it (never *.com).
+pub fn name_matches(name: []u8, host: []u8) -> bool {
+    var h = host
+    if h.len > 0 and h[h.len - 1] == '.' {
+        h = h[0..h.len - 1]
+    }
+    if name.len == 0 or h.len == 0 {
+        return false
+    }
+    if name.len > 2 and name[0] == '*' and name[1] == '.' {
+        let rest = name[1..name.len]
+        var dots: usize = 0
+        for ch in rest {
+            if ch == '.' {
+                dots += 1
+            }
+        }
+        if dots < 2 or rest.find("*") != null or h.len <= rest.len {
+            return false
+        }
+        let label = h[0..h.len - rest.len]
+        return label.find(".") == null and h[h.len - rest.len..h.len].eq_ignore_case(rest)
+    }
+    if name.find("*") != null {
+        return false
+    }
+    return name.eq_ignore_case(h)
+}
+
+// ------------------------------------------------------------------ signatures
+
+fn hash_of(alg: SigAlg) -> ?sha2.Kind {
+    if alg == SigAlg.RsaSha256 or alg == SigAlg.EcdsaSha256 {
+        return sha2.Kind.Sha256
+    }
+    if alg == SigAlg.RsaSha384 or alg == SigAlg.EcdsaSha384 {
+        return sha2.Kind.Sha384
+    }
+    if alg == SigAlg.RsaSha512 or alg == SigAlg.EcdsaSha512 {
+        return sha2.Kind.Sha512
+    }
+    return null
+}
+
+/// Whether `issuer`'s key made `child`'s signature.
+pub fn signed_by(child: *Cert, issuer: *Cert) -> bool {
+    let kind = hash_of(child.sig_alg) orelse return false
+    let digest = sha2.hash(kind, child.der[child.tbs_start..child.tbs_end])
+    let a = child.sig_alg
+    if a == SigAlg.RsaSha256 or a == SigAlg.RsaSha384 or a == SigAlg.RsaSha512 {
+        return issuer.key_kind == KeyKind.Rsa and rsa.verify_pkcs1(issuer.key, issuer.rsa_e, kind, digest, child.signature)
+    }
+    if issuer.key_kind == KeyKind.P256 {
+        return ecdsa.verify(ecdsa.Curve.P256, issuer.key, digest, child.signature)
+    }
+    if issuer.key_kind == KeyKind.P384 {
+        return ecdsa.verify(ecdsa.Curve.P384, issuer.key, digest, child.signature)
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ chains
+
+/// Trusted roots.
+pub struct Store {
+    certs: List(Cert)
+    /// how many certificates in what was loaded did not parse
+    skipped: usize
+}
+
+pub fn empty_store() -> Store {
+    return Store{ .certs = List(Cert).new(), .skipped = 0 }
+}
+
+/// The roots in a PEM bundle, such as /etc/ssl/certs/ca-certificates.crt;
+/// a certificate that does not parse is counted in `skipped`, not added.
+pub fn store_from_pem(text: []u8) -> Store {
+    var s = empty_store()
+    for block in pem.decode_all(text, "CERTIFICATE") {
+        _ = s.add(block)
+    }
+    return s
+}
+
+impl Store {
+    /// Adds a root from its DER; false (and counted) when it does not parse.
+    pub fn add(self: *mut Self, b: []u8) -> bool {
+        let c = parse(b) orelse {
+            self.skipped += 1
+            return false
+        }
+        self.certs.append(c)
+        return true
+    }
+}
+
+/// The most CA certificates, besides the root, a path may have.
+pub const MAX_DEPTH: usize = 8
+
+/// Why the server's chain is not good for `host` at `now` (ms since the
+/// epoch) under `roots`; null when it is. `chain` holds the certificates
+/// as the server sent them, DER: its own first, then any others, in any
+/// order.
+pub fn check_chain(chain: *List(String), host: []u8, now: i64, roots: *Store) -> ?String {
+    if chain.len == 0 {
+        return String.from("the server sent no certificate")
+    }
+    let leaf = parse(chain.*[0]) orelse return String.from("the server's certificate is malformed")
+    let problem = leaf_problem(&leaf, host, now)
+    if problem != null {
+        return problem
+    }
+    // what else the server sent; what does not parse cannot be on a path
+    var pool = List(Cert).new()
+    for i in 1..chain.len {
+        let c = parse(chain.*[i]) orelse continue
+        pool.append(c)
+    }
+    var used = List(bool).new()
+    for _ in 0..pool.len {
+        used.append(false)
+    }
+    var why = String.new()
+    if path(&leaf, 0, &pool, &mut used, now, roots, &mut why) {
+        return null
+    }
+    return why
+}
+
+fn validity_problem(c: *Cert, now: i64, who: []u8) -> ?String {
+    if now < c.not_before {
+        return format("{} is not valid until {}", .{who, time.utc(c.not_before).iso()})
+    }
+    if now > c.not_after {
+        return format("{} expired {}", .{who, time.utc(c.not_after).iso()})
+    }
+    return null
+}
+
+fn names_text(names: *List(String)) -> String {
+    var out = String.new()
+    for n, i in names.* {
+        if i == 5 {
+            out.append(format(" and {} more", .{names.len - 5}))
+            break
+        }
+        if i > 0 {
+            out.append(", ")
+        }
+        out.append(n)
+    }
+    return out
+}
+
+fn leaf_problem(c: *Cert, host: []u8, now: i64) -> ?String {
+    let who = "the server's certificate"
+    if c.version != 3 {
+        return format("{} is not version 3", .{who})
+    }
+    let v = validity_problem(c, now, who)
+    if v != null {
+        return v
+    }
+    if c.unknown_critical {
+        return format("{} has a critical extension nxtls does not know", .{who})
+    }
+    if c.has_basic and c.is_ca {
+        return format("{} is a CA's", .{who})
+    }
+    if c.key_usage >= 0 and (c.key_usage & 1) == 0 {
+        return format("{} may not be used to sign (keyUsage)", .{who})
+    }
+    if !c.has_eku or !c.server_auth {
+        return format("{} is not marked for servers (extendedKeyUsage serverAuth)", .{who})
+    }
+    if c.key_kind == KeyKind.Other {
+        return format("{} has a key nxtls cannot use", .{who})
+    }
+    if !c.has_san or c.dns_names.len == 0 {
+        return format("{} names no host (subjectAltName)", .{who})
+    }
+    for n in c.dns_names {
+        if name_matches(n, host) {
+            return null
+        }
+    }
+    return format("{} is for {}, not {}", .{who, names_text(&c.dns_names), host})
+}
+
+fn ca_problem(c: *Cert, below: usize, now: i64) -> ?String {
+    let who = format("the CA certificate for {}", .{name_text(c.subject)})
+    if c.version != 3 {
+        return format("{} is not version 3", .{who})
+    }
+    let v = validity_problem(c, now, who)
+    if v != null {
+        return v
+    }
+    if c.unknown_critical {
+        return format("{} has a critical extension nxtls does not know", .{who})
+    }
+    if c.constrained {
+        return format("{} has name constraints, which nxtls does not check", .{who})
+    }
+    if !c.has_basic or !c.is_ca {
+        return format("{} is not marked as a CA's (basicConstraints)", .{who})
+    }
+    if c.path_len >= 0 and (below as i64) > c.path_len {
+        return format("{} allows {} CA certificates below it, not {}", .{who, c.path_len, below})
+    }
+    if c.key_usage >= 0 and (c.key_usage & 32) == 0 {
+        return format("{} may not sign certificates (keyUsage)", .{who})
+    }
+    if c.has_eku and !c.server_auth {
+        return format("{} may not issue certificates for servers (extendedKeyUsage)", .{who})
+    }
+    if c.key_kind == KeyKind.Other or (c.key_kind == KeyKind.Rsa and c.key.len < 256) {
+        return format("{} has a key nxtls does not accept (RSA under 2048 bits, or another kind)", .{who})
+    }
+    return null
+}
+
+// the first reason a branch of the search failed is the one reported
+fn note(why: *mut String, text: []u8) {
+    if why.len == 0 {
+        why.append(text)
+    }
+}
+
+// Whether `cur` leads to a trusted root: signed by one, or by a CA from
+// `pool` not yet on the path that leads to one. `below` counts the CAs
+// from `pool` already between `cur` and the server's certificate.
+fn path(cur: *Cert, below: usize, pool: *List(Cert), used: *mut List(bool), now: i64, roots: *Store, why: *mut String) -> bool {
+    if hash_of(cur.sig_alg) == null {
+        note(why, format("{} is signed with an algorithm nxtls does not accept (SHA-1, for one)", .{name_text(cur.subject)}))
+        return false
+    }
+    var named = false
+    for i in 0..roots.certs.len {
+        let r = &roots.certs[i]
+        if r.subject != cur.issuer {
+            continue
+        }
+        named = true
+        if let problem = validity_problem(r, now, format("the trusted root {}", .{name_text(r.subject)})) {
+            note(why, problem)
+            continue
+        }
+        if signed_by(cur, r) {
+            return true
+        }
+        note(why, format("the signature on {} does not verify with the key of the trusted root {}", .{name_text(cur.subject), name_text(r.subject)}))
+    }
+    if below >= MAX_DEPTH {
+        note(why, "the chain is too long")
+        return false
+    }
+    var looped = false
+    for i in 0..pool.len {
+        if pool.*[i].subject != cur.issuer {
+            continue
+        }
+        if used.*[i] {
+            looped = true
+            continue
+        }
+        named = true
+        let ca = &pool.*[i]
+        if let problem = ca_problem(ca, below, now) {
+            note(why, problem)
+            continue
+        }
+        if !signed_by(cur, ca) {
+            note(why, format("the signature on {} does not verify with the key of {}", .{name_text(cur.subject), name_text(ca.subject)}))
+            continue
+        }
+        used.*[i] = true
+        if path(ca, below + 1, pool, used, now, roots, why) {
+            return true
+        }
+        used.*[i] = false
+    }
+    if !named and looped {
+        note(why, "the certificates the server sent go round in a loop that no trusted root ends")
+    } else if !named {
+        note(why, format("{}, which issued {}, is not a trusted root, and the server did not send its certificate", .{name_text(cur.issuer), name_text(cur.subject)}))
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ tests
+
+import std.fs
+import testvec
+
+test "host names: exact, case, a trailing dot, and wildcards only as whole first labels" {
+    expect(name_matches("example.com", "example.com"))
+    expect(name_matches("Example.COM", "example.com"))
+    expect(name_matches("example.com", "EXAMPLE.com."))
+    expect(!name_matches("example.com", "www.example.com"))
+    expect(name_matches("*.example.com", "www.example.com"))
+    expect(name_matches("*.example.com", "WWW.Example.Com"))
+    expect(!name_matches("*.example.com", "example.com"))
+    expect(!name_matches("*.example.com", "a.b.example.com"))
+    expect(!name_matches("*.example.com", ".example.com"))
+    expect(!name_matches("*.com", "example.com"))
+    expect(!name_matches("w*.example.com", "www.example.com"))
+    expect(!name_matches("www.*.com", "www.example.com"))
+    expect(!name_matches("*.*.example.com", "a.b.example.com"))
+    expect(!name_matches("", "example.com"))
+    expect(!name_matches("example.com", ""))
+}
+
+// the vectors' certificates by name
+struct Named {
+    names: List(String)
+    ders: List(String)
+}
+
+fn named_certs(text: []u8) -> Named {
+    var out = Named{ .names = List(String).new(), .ders = List(String).new() }
+    for line in text.lines() {
+        if line.starts_with("cert ") {
+            let f = line.split(" ")
+            out.names.append(String.from(f[1]))
+            out.ders.append(testvec.unhex(f[2]))
+        }
+    }
+    return out
+}
+
+fn der_named(n: *Named, name: []u8) -> String {
+    for i in 0..n.names.len {
+        if n.names[i] == name {
+            return n.ders[i].clone()
+        }
+    }
+    println("x509: no certificate {} in the vectors", .{name})
+    expect(false)
+    return String.new()
+}
+
+fn vectors() -> String {
+    return fs.read("tests/vectors/x509.txt") catch {
+        panic("tests/vectors/x509.txt")
+    }
+}
+
+fn kind_text(k: KeyKind) -> []u8 {
+    if k == KeyKind.Rsa {
+        return "rsa"
+    }
+    if k == KeyKind.P256 {
+        return "p256"
+    }
+    if k == KeyKind.P384 {
+        return "p384"
+    }
+    return "other"
+}
+
+fn alg_text(a: SigAlg) -> []u8 {
+    if a == SigAlg.RsaSha256 {
+        return "rsa-sha256"
+    }
+    if a == SigAlg.RsaSha384 {
+        return "rsa-sha384"
+    }
+    if a == SigAlg.RsaSha512 {
+        return "rsa-sha512"
+    }
+    if a == SigAlg.EcdsaSha256 {
+        return "ecdsa-sha256"
+    }
+    if a == SigAlg.EcdsaSha384 {
+        return "ecdsa-sha384"
+    }
+    if a == SigAlg.EcdsaSha512 {
+        return "ecdsa-sha512"
+    }
+    return "other"
+}
+
+test "the vectors: what the reference reads from each certificate, and malformed ones refused" {
+    let text = vectors()
+    let certs = named_certs(text)
+    var infos = 0
+    var malformed = 0
+    for line in text.lines() {
+        let f = line.split(" ")
+        if line.starts_with("info ") {
+            // info name version not-before not-after key sig-alg ca path-len key-usage server-auth dns-names
+            let c = parse(der_named(&certs, f[1])) orelse {
+                println("x509: {} does not parse", .{f[1]})
+                panic("an info certificate did not parse")
+            }
+            var got = format("{} {} {} {} {}", .{c.version, c.not_before, c.not_after, kind_text(c.key_kind), alg_text(c.sig_alg)})
+            got.append(format(" {} {} {}", .{if c.has_basic { if c.is_ca { "1" } else { "0" } } else { "-" }, c.path_len, c.key_usage}))
+            got.append(format(" {} ", .{if c.has_eku { if c.server_auth { "1" } else { "0" } } else { "-" }}))
+            if c.dns_names.len == 0 {
+                got.append("-")
+            }
+            for n, i in c.dns_names {
+                if i > 0 {
+                    got.append(",")
+                }
+                got.append(n)
+            }
+            var want = String.new()
+            for i in 2..f.len {
+                if i > 2 {
+                    want.append(" ")
+                }
+                want.append(f[i])
+            }
+            if got != want {
+                println("x509 info {}: got {} want {}", .{f[1], got, want})
+            }
+            expect_eq(got, want)
+            infos += 1
+        } else if line.starts_with("malformed ") {
+            let bad = parse(testvec.unhex(f[2]))
+            if bad != null {
+                println("x509: malformed {} parsed", .{f[1]})
+            }
+            expect(bad == null)
+            malformed += 1
+        }
+    }
+    expect(infos >= 10)
+    expect(malformed >= 8)
+}
+
+test "the vectors: chains, as Python's cryptography verifier judges them" {
+    let text = vectors()
+    let certs = named_certs(text)
+    var n = 0
+    for line in text.lines() {
+        if !line.starts_with("chain ") {
+            continue
+        }
+        // chain expect host now roots certs what
+        let f = line.split(" ")
+        var roots = empty_store()
+        if f[4] != "-" {
+            for name in f[4].split(",") {
+                expect(roots.add(der_named(&certs, name)))
+            }
+        }
+        var chain = List(String).new()
+        if f[5] != "-" {
+            for name in f[5].split(",") {
+                chain.append(der_named(&certs, name))
+            }
+        }
+        let now = f[3].parse_int(i64) catch {
+            panic("bad time in a vector")
+        }
+        let problem = check_chain(&chain, f[2], now, &roots)
+        let ok = problem == null
+        if let p = problem {
+            if f[1] == "valid" {
+                println("x509 chain {} ({}): {}", .{n, f[6], p})
+            }
+        } else if f[1] != "valid" {
+            println("x509 chain {} ({}) passed", .{n, f[6]})
+        }
+        expect(ok == (f[1] == "valid"))
+        n += 1
+    }
+    expect(n >= 40)
+}
+
+test "the captured chains and roots load from PEM as the vectors have them" {
+    let text = vectors()
+    let certs = named_certs(text)
+    for host in ["discord.com", "gateway.discord.gg", "callook.info"] {
+        let file = fs.read(format("tests/certs/{}.pem", .{host})) catch {
+            panic("tests/certs")
+        }
+        let blocks = pem.decode_all(file, "CERTIFICATE")
+        expect_eq(blocks.len, 3)
+        for b, i in blocks {
+            expect(b == der_named(&certs, format("{}/{}", .{host, i})))
+        }
+    }
+    let bundle = fs.read("tests/certs/roots.pem") catch {
+        panic("tests/certs/roots.pem")
+    }
+    let roots = store_from_pem(bundle)
+    // the zero serial, the P-521 key and the SHA-1 self-signature load too
+    expect_eq(roots.certs.len, 6)
+    expect_eq(roots.skipped, 0)
+    expect(roots.certs[4].key_kind == KeyKind.Other)
+    expect(roots.certs[5].sig_alg == SigAlg.Other)
+    expect_eq(name_text(roots.certs[0].subject), "GTS Root R4")
+}

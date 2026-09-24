@@ -44,6 +44,8 @@ radio club, which checks every request's Ed25519 signature with it.
 | `chacha20poly1305` | ChaCha20, Poly1305 and their AEAD, constant time | RFC 8439 (every vector of its appendix, among them the Poly1305 carry and reduction cases), random lengths and counters, tampering |
 | `ecdsa` | ECDSA verification on P-256 and P-384, signatures in DER (verify only) | curve checks (G on the curve, n G at infinity), deterministic signatures from Python's cryptography, malleable s, tampering, keys off the curve, r and s out of range, strict DER |
 | `rsa` | RSA verification: PKCS #1 v1.5 (certificates) and PSS (TLS 1.3), keys of 2048 to 8192 bits (verify only) | keys of 2048, 2049, 3072 and 4096 bits made from a seed, signatures checked by Python's cryptography, PSS's emBits edge cases, salt and trailer errors, Bleichenbacher's e = 3 forgery |
+| `x509` | X.509 certificates: reading them, and checking a server's chain against trusted roots for a host name: path building across cross-signed CAs, validity, CA constraints and path lengths, key usage and extended key usage, host names with wildcards | 68 chains and 13 malformed certificates, judged by Python's cryptography's own path validation (marked where nxtls is stricter); the real chains of discord.com, gateway.discord.gg and callook.info; roots that must still load (a zero serial, P-521, SHA-1) |
+| `pem` | PEM blocks, as certificate files and CA bundles hold them | text around the blocks, CRLF, broken and unterminated blocks |
 | `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
 | `bn` | big integers with Montgomery multiplication, for verification (public values only) | known products, powers and inverses; through `ecdsa` and `rsa` |
 | `der` | a strict DER reader: shortest lengths, positive minimal integers | malformed and non-minimal encodings |
@@ -83,13 +85,19 @@ nx test src/x25519.nx
 nx test src/chacha20poly1305.nx
 nx test src/ecdsa.nx
 nx test src/rsa.nx
+nx test src/pem.nx
+nx test src/x509.nx
 python tools/gen.py --check            # the vectors and tables are current
 ```
 
 `tools/gen.py` is test tooling only. It derives every constant in
 `src/tables.nx` from its definition and writes the vectors in
 `tests/vectors/` from Python's `hashlib`, `hmac` and the `cryptography`
-package, asserting the published values from each standard along the way.
+package, asserting the published values from each standard along the way;
+the X.509 chains are judged by the `cryptography` package's own path
+validation. `tests/certs/` holds the chains discord.com, gateway.discord.gg
+and callook.info sent on 2026-09-24, and the roots from Mozilla's store
+that they and the tests need.
 
 CI runs the tests on Linux (built against glibc, whose debug build traps
 on undefined behaviour), Windows and macOS. It also checks that no module
@@ -103,7 +111,7 @@ The order lets each piece be tested alone:
 1. ~~SHA-2, HMAC and HKDF~~ (and SHA-1, for WebSocket)
 2. ~~Ed25519 verification~~
 3. ~~ChaCha20-Poly1305 and X25519~~
-4. DER, PEM, X.509, RSA and ECDSA verification
+4. ~~DER, PEM, X.509, RSA and ECDSA verification~~
 5. The record layer and the TLS 1.3 handshake: replayed against RFC 8448
    byte for byte, then live hosts, with badssl.com's broken hosts as
    negative tests
