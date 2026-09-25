@@ -23,13 +23,21 @@
 //   certificates (keyUsage) and to issue server certificates
 //   (extendedKeyUsage), and allowing as many CAs below it as there are
 //   (pathLenConstraint);
-// - the server's certificate: version 3, for `host` (subjectAltName DNS
-//   names; a wildcard only as the whole first label, standing for one
-//   label, with at least two labels after it), for servers
+// - the server's certificate: version 3, for `host` (a name among its
+//   subjectAltName DNS names, a wildcard only as the whole first label,
+//   standing for one label, with at least two labels after it; an IPv4 or
+//   IPv6 address among its IP addresses, byte for byte), for servers
 //   (extendedKeyUsage serverAuth, which it must have), allowed to sign
 //   (keyUsage), and not a CA's;
 // - no certificate on the path has a critical extension nxtls does not
 //   know.
+//
+// The search is bounded, so a server cannot hold the client up with
+// certificates built to be tried in every order: a path has at most
+// MAX_DEPTH CAs; a certificate with the name and key of one already on
+// the path is not tried again (it could only lead where that one did);
+// and a chain that needs more than MAX_SIGNATURE_CHECKS signatures
+// checked is refused, as Go refuses one.
 //
 // Not checked: revocation (no OCSP, no CRLs); and name constraints: a CA
 // that has them is refused rather than trusted without them. A root is
@@ -103,9 +111,11 @@ pub struct Cert {
     /// extendedKeyUsage: whether present, and whether it allows serverAuth
     has_eku: bool
     server_auth: bool
-    /// subjectAltName: whether present, and its DNS names
+    /// subjectAltName: whether present, its DNS names, and its IP addresses
+    /// (4 bytes each for IPv4, 16 for IPv6)
     has_san: bool
     dns_names: List(String)
+    ip_addrs: List(String)
     /// whether nameConstraints is present
     constrained: bool
     /// whether a critical extension nxtls does not know is present
@@ -138,7 +148,7 @@ const OID_SERVER_AUTH: []u8 = b"\x2b\x06\x01\x05\x05\x07\x03\x01"
 // ------------------------------------------------------------------ reading
 
 fn blank(b: []u8) -> Cert {
-    return Cert{ .der = String.from(b), .version = 1, .tbs_start = 0, .tbs_end = 0, .sig_alg = SigAlg.Other, .signature = String.new(), .issuer = String.new(), .subject = String.new(), .not_before = 0, .not_after = 0, .key_kind = KeyKind.Other, .key = String.new(), .rsa_e = String.new(), .has_basic = false, .is_ca = false, .path_len = -1, .key_usage = -1, .has_eku = false, .server_auth = false, .has_san = false, .dns_names = List(String).new(), .constrained = false, .unknown_critical = false }
+    return Cert{ .der = String.from(b), .version = 1, .tbs_start = 0, .tbs_end = 0, .sig_alg = SigAlg.Other, .signature = String.new(), .issuer = String.new(), .subject = String.new(), .not_before = 0, .not_after = 0, .key_kind = KeyKind.Other, .key = String.new(), .rsa_e = String.new(), .has_basic = false, .is_ca = false, .path_len = -1, .key_usage = -1, .has_eku = false, .server_auth = false, .has_san = false, .dns_names = List(String).new(), .ip_addrs = List(String).new(), .constrained = false, .unknown_critical = false }
 }
 
 /// A certificate from its DER; null when that is malformed or has bytes
@@ -486,7 +496,9 @@ fn ext_key_usage(v: []u8, c: *mut Cert) -> bool {
 }
 
 // GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName; dNSName is
-// [2] IA5String. A DNS name with a byte no host name has is left out.
+// [2] IA5String, iPAddress [7] OCTET STRING. A DNS name with a byte no
+// host name has is left out; an address is 4 bytes or 16 (RFC 5280
+// 4.2.1.6), anything else malformed.
 fn alt_names(v: []u8, c: *mut Cert) -> bool {
     let seq = der.expect_tag(v, 0, v.len, 0x30) orelse return false
     if seq.end != v.len or seq.body == seq.end {
@@ -496,7 +508,12 @@ fn alt_names(v: []u8, c: *mut Cert) -> bool {
     var at = seq.body
     while at < seq.end {
         let t = der.read(v, at, seq.end) orelse return false
-        if t.tag == 0x82 {
+        if t.tag == 0x87 {
+            if t.end - t.body != 4 and t.end - t.body != 16 {
+                return false
+            }
+            c.ip_addrs.append(String.from(v[t.body..t.end]))
+        } else if t.tag == 0x82 {
             let name = v[t.body..t.end]
             var plain = name.len > 0
             for ch in name {
@@ -573,6 +590,154 @@ pub fn name_matches(name: []u8, host: []u8) -> bool {
     return name.eq_ignore_case(h)
 }
 
+// an IPv4 address in dotted decimal, four numbers to 255 without leading
+// zeros (as Go and Python read them), as 4 bytes
+fn ipv4_of(s: []u8) -> ?String {
+    let parts = s.split(".")
+    if parts.len != 4 {
+        return null
+    }
+    var out = String.new()
+    for p in parts {
+        if p.len == 0 or p.len > 3 or (p.len > 1 and p[0] == '0') {
+            return null
+        }
+        var v: usize = 0
+        for ch in p {
+            if ch < '0' or ch > '9' {
+                return null
+            }
+            v = v * 10 + ((ch - '0') as usize)
+        }
+        if v > 255 {
+            return null
+        }
+        out.push_byte(@truncate(u8, v))
+    }
+    return out
+}
+
+// the 16-bit groups on one side of an IPv6 address's "::" (RFC 4291 2.2),
+// the last 32 bits perhaps in dotted decimal when `v4` allows it
+fn v6_groups(s: []u8, v4: bool, out: *mut List(usize)) -> bool {
+    if s.len == 0 {
+        return true
+    }
+    let parts = s.split(":")
+    for p, i in parts {
+        if v4 and i == parts.len - 1 and p.find(".") != null {
+            let b = ipv4_of(p) orelse return false
+            out.append(((b[0] as usize) << 8) | (b[1] as usize))
+            out.append(((b[2] as usize) << 8) | (b[3] as usize))
+            return true
+        }
+        if p.len == 0 or p.len > 4 {
+            return false
+        }
+        var v: usize = 0
+        for ch in p {
+            var d: usize = 0
+            if ch >= '0' and ch <= '9' {
+                d = (ch - '0') as usize
+            } else if ch >= 'a' and ch <= 'f' {
+                d = ((ch - 'a') as usize) + 10
+            } else if ch >= 'A' and ch <= 'F' {
+                d = ((ch - 'A') as usize) + 10
+            } else {
+                return false
+            }
+            v = v * 16 + d
+        }
+        out.append(v)
+    }
+    return true
+}
+
+// an IPv6 address in the text forms of RFC 4291 2.2, as 16 bytes
+fn ipv6_of(s: []u8) -> ?String {
+    var head = List(usize).new()
+    var tail = List(usize).new()
+    if let at = s.find("::") {
+        let rest = s[at + 2..s.len]
+        if rest.find("::") != null or !v6_groups(s[0..at], false, &mut head) or !v6_groups(rest, true, &mut tail) {
+            return null
+        }
+        if head.len + tail.len > 7 {
+            return null
+        }
+    } else if !v6_groups(s, true, &mut head) or head.len != 8 {
+        return null
+    }
+    var out = String.new()
+    for g in head {
+        out.push_byte(@truncate(u8, g >> 8))
+        out.push_byte(@truncate(u8, g))
+    }
+    for _ in head.len + tail.len..8 {
+        out.push_byte(0)
+        out.push_byte(0)
+    }
+    for g in tail {
+        out.push_byte(@truncate(u8, g >> 8))
+        out.push_byte(@truncate(u8, g))
+    }
+    return out
+}
+
+/// The address `host` spells, 4 bytes for IPv4 and 16 for IPv6; null when
+/// it is a name. A certificate is for an address only through its IP
+/// addresses (subjectAltName iPAddress), never its DNS names.
+pub fn ip_of(host: []u8) -> ?String {
+    if host.find(":") != null {
+        return ipv6_of(host)
+    }
+    return ipv4_of(host)
+}
+
+/// An address as text, IPv6 as RFC 5952 writes it (the longest run of
+/// zero groups as "::").
+pub fn ip_text(b: []u8) -> String {
+    if b.len == 4 {
+        return format("{}.{}.{}.{}", .{b[0], b[1], b[2], b[3]})
+    }
+    if b.len != 16 {
+        return String.from("(a malformed address)")
+    }
+    var groups = List(usize).new()
+    for i in 0..8 {
+        groups.append(((b[2 * i] as usize) << 8) | (b[2 * i + 1] as usize))
+    }
+    var best: usize = 0
+    var best_len: usize = 0
+    var i: usize = 0
+    while i < 8 {
+        var j = i
+        while j < 8 and groups[j] == 0 {
+            j += 1
+        }
+        if j - i > best_len {
+            best = i
+            best_len = j - i
+        }
+        i = if j > i { j } else { i + 1 }
+    }
+    var out = String.new()
+    var k: usize = 0
+    while k < 8 {
+        if best_len >= 2 and k == best {
+            out.append("::")
+            k += best_len
+            continue
+        }
+        if out.len > 0 and out[out.len - 1] != ':' {
+            out.append(":")
+        }
+        out.append(format("{x}", .{groups[k]}))
+        k += 1
+    }
+    return out
+}
+
 // ------------------------------------------------------------------ signatures
 
 fn hash_of(alg: SigAlg) -> ?sha2.Kind {
@@ -643,10 +808,15 @@ impl Store {
 /// The most CA certificates, besides the root, a path may have.
 pub const MAX_DEPTH: usize = 8
 
-/// Why the server's chain is not good for `host` at `now` (ms since the
-/// epoch) under `roots`; null when it is. `chain` holds the certificates
-/// as the server sent them, DER: its own first, then any others, in any
-/// order.
+/// The most signatures one check of a chain verifies, Go's limit: past
+/// that the chain is refused, so certificates built to be tried in every
+/// order cannot hold the client up (a check costs a few milliseconds).
+pub const MAX_SIGNATURE_CHECKS: usize = 100
+
+/// Why the server's chain is not good for `host` (a name, or an IPv4 or
+/// IPv6 address) at `now` (ms since the epoch) under `roots`; null when it
+/// is. `chain` holds the certificates as the server sent them, DER: its
+/// own first, then any others, in any order.
 pub fn check_chain(chain: *List(String), host: []u8, now: i64, roots: *Store) -> ?String {
     if chain.len == 0 {
         return String.from("the server sent no certificate")
@@ -667,8 +837,12 @@ pub fn check_chain(chain: *List(String), host: []u8, now: i64, roots: *Store) ->
         used.append(false)
     }
     var why = String.new()
-    if path(&leaf, 0, &pool, &mut used, now, roots, &mut why) {
+    var checks: usize = 0
+    if path(&leaf, 0, &pool, &mut used, now, roots, &mut why, &mut checks) {
         return null
+    }
+    if checks > MAX_SIGNATURE_CHECKS {
+        return format("finding a path through the certificates the server sent took more than {} signature checks, so nxtls stopped", .{MAX_SIGNATURE_CHECKS})
     }
     return why
 }
@@ -683,11 +857,19 @@ fn validity_problem(c: *Cert, now: i64, who: []u8) -> ?String {
     return null
 }
 
-fn names_text(names: *List(String)) -> String {
+// the names and addresses a certificate is for, the first five
+fn names_text(c: *Cert) -> String {
+    var all = List(String).new()
+    for n in c.dns_names {
+        all.append(n.clone())
+    }
+    for a in c.ip_addrs {
+        all.append(ip_text(a))
+    }
     var out = String.new()
-    for n, i in names.* {
+    for n, i in all {
         if i == 5 {
-            out.append(format(" and {} more", .{names.len - 5}))
+            out.append(format(" and {} more", .{all.len - 5}))
             break
         }
         if i > 0 {
@@ -722,15 +904,23 @@ fn leaf_problem(c: *Cert, host: []u8, now: i64) -> ?String {
     if c.key_kind == KeyKind.Other {
         return format("{} has a key nxtls cannot use", .{who})
     }
-    if !c.has_san or c.dns_names.len == 0 {
+    if !c.has_san or c.dns_names.len + c.ip_addrs.len == 0 {
         return format("{} names no host (subjectAltName)", .{who})
     }
-    for n in c.dns_names {
-        if name_matches(n, host) {
-            return null
+    if let ip = ip_of(host) {
+        for a in c.ip_addrs {
+            if a == ip {
+                return null
+            }
+        }
+    } else {
+        for n in c.dns_names {
+            if name_matches(n, host) {
+                return null
+            }
         }
     }
-    return format("{} is for {}, not {}", .{who, names_text(&c.dns_names), host})
+    return format("{} is for {}, not {}", .{who, names_text(c), host})
 }
 
 fn ca_problem(c: *Cert, below: usize, now: i64) -> ?String {
@@ -773,10 +963,32 @@ fn note(why: *mut String, text: []u8) {
     }
 }
 
+// whether `issuer`'s key made `child`'s signature, counted in `checks`;
+// false without checking once MAX_SIGNATURE_CHECKS have been made, which
+// ends the search
+fn checked(child: *Cert, issuer: *Cert, checks: *mut usize) -> bool {
+    checks.* += 1
+    return checks.* <= MAX_SIGNATURE_CHECKS and signed_by(child, issuer)
+}
+
+// whether a certificate with c's name and key is on the path already (as
+// Go's alreadyInChain has it): wherever c could lead, that one could, by
+// a shorter path, so trying c only goes round in a loop
+fn on_path(c: *Cert, pool: *List(Cert), used: *List(bool)) -> bool {
+    for i in 0..pool.len {
+        let p = &pool.*[i]
+        if used.*[i] and p.subject == c.subject and p.key_kind == c.key_kind and p.key == c.key and p.rsa_e == c.rsa_e {
+            return true
+        }
+    }
+    return false
+}
+
 // Whether `cur` leads to a trusted root: signed by one, or by a CA from
 // `pool` not yet on the path that leads to one. `below` counts the CAs
-// from `pool` already between `cur` and the server's certificate.
-fn path(cur: *Cert, below: usize, pool: *List(Cert), used: *mut List(bool), now: i64, roots: *Store, why: *mut String) -> bool {
+// from `pool` already between `cur` and the server's certificate;
+// `checks` the signatures checked so far.
+fn path(cur: *Cert, below: usize, pool: *List(Cert), used: *mut List(bool), now: i64, roots: *Store, why: *mut String, checks: *mut usize) -> bool {
     if hash_of(cur.sig_alg) == null {
         note(why, format("{} is signed with an algorithm nxtls does not accept (SHA-1, for one)", .{name_text(cur.subject)}))
         return false
@@ -792,8 +1004,11 @@ fn path(cur: *Cert, below: usize, pool: *List(Cert), used: *mut List(bool), now:
             note(why, problem)
             continue
         }
-        if signed_by(cur, r) {
+        if checked(cur, r, checks) {
             return true
+        }
+        if checks.* > MAX_SIGNATURE_CHECKS {
+            return false
         }
         note(why, format("the signature on {} does not verify with the key of the trusted root {}", .{name_text(cur.subject), name_text(r.subject)}))
     }
@@ -806,25 +1021,31 @@ fn path(cur: *Cert, below: usize, pool: *List(Cert), used: *mut List(bool), now:
         if pool.*[i].subject != cur.issuer {
             continue
         }
-        if used.*[i] {
+        let ca = &pool.*[i]
+        if on_path(ca, pool, used) {
             looped = true
             continue
         }
         named = true
-        let ca = &pool.*[i]
         if let problem = ca_problem(ca, below, now) {
             note(why, problem)
             continue
         }
-        if !signed_by(cur, ca) {
+        if !checked(cur, ca, checks) {
+            if checks.* > MAX_SIGNATURE_CHECKS {
+                return false
+            }
             note(why, format("the signature on {} does not verify with the key of {}", .{name_text(cur.subject), name_text(ca.subject)}))
             continue
         }
         used.*[i] = true
-        if path(ca, below + 1, pool, used, now, roots, why) {
+        if path(ca, below + 1, pool, used, now, roots, why, checks) {
             return true
         }
         used.*[i] = false
+        if checks.* > MAX_SIGNATURE_CHECKS {
+            return false
+        }
     }
     if !named and looped {
         note(why, "the certificates the server sent go round in a loop that no trusted root ends")
@@ -854,6 +1075,51 @@ test "host names: exact, case, a trailing dot, and wildcards only as whole first
     expect(!name_matches("*.*.example.com", "a.b.example.com"))
     expect(!name_matches("", "example.com"))
     expect(!name_matches("example.com", ""))
+}
+
+// an address's bytes as hex, or "-" when the text is not one
+fn ip_hex(host: []u8) -> String {
+    let b = ip_of(host) orelse return String.from("-")
+    var out = String.new()
+    for x in b {
+        out.append(format("{x}", .{x}))
+        out.append(" ")
+    }
+    return out
+}
+
+test "IP addresses: the forms of RFC 4291 and dotted decimal read, others not, and written back as RFC 5952 has them" {
+    expect_eq(ip_hex("192.0.2.7"), "c0 0 2 7 ")
+    expect_eq(ip_hex("0.0.0.0"), "0 0 0 0 ")
+    expect_eq(ip_hex("255.255.255.255"), "ff ff ff ff ")
+    for bad in ["192.0.2", "192.0.2.7.1", "192.0.2.256", "192.0.2.07", "192.0.2.", ".192.0.2", "192.0..7", "1.2.3.-4", "example.com", "0x7f.0.0.1", ""] {
+        if ip_of(bad) != null {
+            println("x509: {} read as an address", .{bad})
+        }
+        expect(ip_of(bad) == null)
+    }
+    expect_eq(ip_hex("::"), "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ")
+    expect_eq(ip_hex("::1"), "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 ")
+    expect_eq(ip_hex("2001:DB8::1"), "20 1 d b8 0 0 0 0 0 0 0 0 0 0 0 1 ")
+    expect_eq(ip_hex("2001:db8:0:0:1:0:0:1"), "20 1 d b8 0 0 0 0 0 1 0 0 0 0 0 1 ")
+    expect_eq(ip_hex("::ffff:192.0.2.7"), "0 0 0 0 0 0 0 0 0 0 ff ff c0 0 2 7 ")
+    expect_eq(ip_hex("1:2:3:4:5:6:7::"), "0 1 0 2 0 3 0 4 0 5 0 6 0 7 0 0 ")
+    for bad in [":::", "1:::2", "1::2::3", ":1::", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8::", "12345::", "g::1", "1.2.3.4::", "::1.2.3", "fe80::1%eth0", "[::1]"] {
+        if ip_of(bad) != null {
+            println("x509: {} read as an address", .{bad})
+        }
+        expect(ip_of(bad) == null)
+    }
+    for text in ["192.0.2.7", "::", "::1", "1::", "2001:db8::1", "2001:db8:0:1:1:1:1:1", "2001:0:0:1::1", "1:0:0:2::3", "::ffff:c000:207"] {
+        let b = ip_of(text) orelse {
+            panic("an address did not read")
+        }
+        expect_eq(ip_text(b), text)
+    }
+    let spelled = ip_of("2001:0DB8:0000:0000:0000:0000:0000:0001") orelse {
+        panic("an address did not read")
+    }
+    expect_eq(ip_text(spelled), "2001:db8::1")
 }
 
 // the vectors' certificates by name
@@ -1012,6 +1278,40 @@ test "the vectors: chains, as Python's cryptography verifier judges them" {
         n += 1
     }
     expect(n >= 40)
+}
+
+test "certificates built to be tried in every order: a ring ends as a loop at once, a maze after MAX_SIGNATURE_CHECKS" {
+    let text = vectors()
+    let certs = named_certs(text)
+    var seen = 0
+    for line in text.lines() {
+        if !line.starts_with("chain ") {
+            continue
+        }
+        let f = line.split(" ")
+        let maze = f[6] == "a_maze_of_CAs_that_ends_nowhere"
+        if !maze and f[6] != "seven_CAs_with_one_name_and_key" {
+            continue
+        }
+        var roots = empty_store()
+        for name in f[4].split(",") {
+            expect(roots.add(der_named(&certs, name)))
+        }
+        var chain = List(String).new()
+        for name in f[5].split(",") {
+            chain.append(der_named(&certs, name))
+        }
+        let problem = check_chain(&chain, "example.com", 1780272000000, &roots) orelse {
+            panic("a chain with no way to a root passed")
+        }
+        if maze {
+            expect(problem.find("signature checks") != null)
+        } else {
+            expect(problem.find("loop") != null)
+        }
+        seen += 1
+    }
+    expect_eq(seen, 2)
 }
 
 test "the captured chains and roots load from PEM as the vectors have them" {

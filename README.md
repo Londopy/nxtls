@@ -28,7 +28,7 @@ talks to Discord through its TLS client.
 
 > [!WARNING]
 > **New.** The TLS client works against Discord, GitHub, Google,
-> Cloudflare and OpenSSL 3, and replays 35 recorded exchanges byte for
+> Cloudflare and OpenSSL 3, and replays 36 recorded exchanges byte for
 > byte; everything under it is tested against published vectors and
 > Python's `cryptography`. None of it has been reviewed by someone who
 > knows TLS yet: weigh that before trusting it with anything that matters.
@@ -37,7 +37,7 @@ talks to Discord through its TLS client.
 
 | module | what | tested against |
 | --- | --- | --- |
-| `tls` | a TLS 1.3 client: TLS_CHACHA20_POLY1305_SHA256, X25519, the server's signature by ECDSA P-256/P-384 or RSA-PSS, its chain checked by `x509`; HelloRetryRequest, KeyUpdate, a server asking for a client certificate. `Client` is the protocol alone (bytes in, bytes out); `Conn` runs it over TCP | RFC 8448's key schedule and Finished values; 35 exchanges with a server gen.py plays from Python's `cryptography`, byte for byte (every alert the client sends among them); OpenSSL 3's `s_server` in twelve configurations; live, Discord, callook.info, GitHub, Google and Cloudflare |
+| `tls` | a TLS 1.3 client: TLS_CHACHA20_POLY1305_SHA256, X25519, the server's signature by ECDSA P-256/P-384 or RSA-PSS, its chain checked by `x509`; HelloRetryRequest, KeyUpdate, a server asking for a client certificate; one deadline for the whole handshake, and a connection cut without close_notify told from a closed one. `Client` is the protocol alone (bytes in, bytes out); `Conn` runs it over TCP | RFC 8448's key schedule and Finished values; 36 exchanges with a server gen.py plays from Python's `cryptography`, byte for byte (every alert the client sends among them); OpenSSL 3's `s_server` in twelve configurations; live, Discord, callook.info, GitHub, Google and Cloudflare, by name and by IP address |
 | `sha2` | SHA-256, SHA-384, SHA-512 | FIPS 180-4 messages, every padding boundary, a million a's |
 | `sha1` | SHA-1, and the WebSocket handshake's `Sec-WebSocket-Accept` (never for signatures or integrity: SHA-1 is broken) | FIPS 180-4 messages, every padding boundary, a million a's, RFC 6455's example |
 | `hmac` | HMAC over each of them, constant-time `verify` | RFC 4231, keys either side of the block size |
@@ -47,7 +47,7 @@ talks to Discord through its TLS client.
 | `chacha20poly1305` | ChaCha20, Poly1305 and their AEAD, constant time | RFC 8439 (every vector of its appendix, among them the Poly1305 carry and reduction cases), random lengths and counters, tampering |
 | `ecdsa` | ECDSA verification on P-256 and P-384, signatures in DER (verify only) | curve checks (G on the curve, n G at infinity), deterministic signatures from Python's cryptography, malleable s, tampering, keys off the curve, r and s out of range, strict DER |
 | `rsa` | RSA verification: PKCS #1 v1.5 (certificates) and PSS (TLS 1.3), keys of 2048 to 8192 bits (verify only) | keys of 2048, 2049, 3072 and 4096 bits made from a seed, signatures checked by Python's cryptography, PSS's emBits edge cases, salt and trailer errors, Bleichenbacher's e = 3 forgery |
-| `x509` | X.509 certificates: reading them, and checking a server's chain against trusted roots for a host name: path building across cross-signed CAs, validity, CA constraints and path lengths, key usage and extended key usage, host names with wildcards | 68 chains and 13 malformed certificates, judged by Python's cryptography's own path validation (marked where nxtls is stricter); the real chains of discord.com, gateway.discord.gg and callook.info; roots that must still load (a zero serial, P-521, SHA-1) |
+| `x509` | X.509 certificates: reading them, and checking a server's chain against trusted roots for a host name or an IP address: path building across cross-signed CAs, validity, CA constraints and path lengths, key usage and extended key usage, host names with wildcards, IPv4 and IPv6 addresses; the search bounded, so chains built to stall it end quickly | 80 chains and 14 malformed certificates, judged by Python's cryptography's own path validation (marked where nxtls is stricter or, once, more lenient); the real chains of discord.com, gateway.discord.gg and callook.info; roots that must still load (a zero serial, P-521, SHA-1) |
 | `entropy` | random bytes from the operating system (/dev/urandom, refusing a regular file planted in its place; none on Windows, where it says so) | lengths, repeats, every byte value in 64 KB |
 | `pem` | PEM blocks, as certificate files and CA bundles hold them | text around the blocks, CRLF, broken and unterminated blocks |
 | `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
@@ -81,6 +81,15 @@ try conn.send("GET /api/v10/gateway HTTP/1.1\r\nHost: discord.com\r\nConnection:
 let answer = try conn.read_all(1 << 20)   // until the server closes
 conn.close()
 ```
+
+`timeout_ms` bounds the whole handshake, connecting included, and then
+each wait for the server. `read_all` fails with `error.Truncated` when
+the connection ends without the server's close_notify, since the answer
+may then be cut short; some servers (Google's, for one) always end that
+way, so for them read with `recv`, which returns "" at either end, and
+trust the answer's own framing (an HTTP Content-Length, a WebSocket
+close), with `conn.truncated()` saying which end it was. Certificates
+are not checked for revocation: no OCSP, no CRLs.
 
 ```nexium
 import nxtls.sha2

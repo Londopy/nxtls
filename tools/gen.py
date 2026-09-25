@@ -21,6 +21,7 @@ import base64
 import datetime
 import hashlib
 import hmac as pyhmac
+import ipaddress
 import os
 import random
 import sys
@@ -1272,7 +1273,11 @@ def ref_chain(certs, roots, chain, host, now):
         except Exception:
             pass
     try:
-        verifier = xv.PolicyBuilder().store(store).time(now).build_server_verifier(xv.DNSName(host))
+        try:
+            subject = xv.IPAddress(ipaddress.ip_address(host))
+        except ValueError:
+            subject = xv.DNSName(host)
+        verifier = xv.PolicyBuilder().store(store).time(now).build_server_verifier(subject)
         verifier.verify(leaf, extra)
         return True
     except Exception:
@@ -1313,13 +1318,15 @@ def x509_vectors():
         return make_cert(cn, key, cn, key, profile("root", key, key, **over), *t)
 
     def ca_cert(cn, key, issuer, issuer_key, t=ca_t, pathlen=0, **kw):
-        over = {k: v for k, v in kw.items() if k not in ("alg", "version")}
-        rest = {k: v for k, v in kw.items() if k in ("alg", "version")}
+        over = {k: v for k, v in kw.items() if k not in ("alg", "version", "serial")}
+        rest = {k: v for k, v in kw.items() if k in ("alg", "version", "serial")}
         return make_cert(cn, key, issuer, issuer_key, profile("ca", key, issuer_key, pathlen=pathlen, **over), *t, **rest)
 
+    make_args = ("alg", "version", "tamper", "inner_alg", "times", "sig_unused", "serial")
+
     def leaf_cert(key, issuer, issuer_key, sans=names, t=leaf_t, cn="example.com", **kw):
-        over = {k: v for k, v in kw.items() if k not in ("alg", "version", "tamper", "inner_alg", "times", "sig_unused")}
-        rest = {k: v for k, v in kw.items() if k in ("alg", "version", "tamper", "inner_alg", "times", "sig_unused")}
+        over = {k: v for k, v in kw.items() if k not in make_args}
+        rest = {k: v for k, v in kw.items() if k in make_args}
         return make_cert(cn, key, issuer, issuer_key, profile("leaf", key, issuer_key, sans, **over), *t, **rest)
 
     cert("root", root_cert("Test Root EC", k_root))
@@ -1513,6 +1520,64 @@ def x509_vectors():
     case("valid", "www.callook.info", real, every, c3, "www.callook.info")
     case("invalid", "callook.info", real, ["roots/gts-r4"], c3, "callook.info under another root")
     case("invalid", "callook.info", real, every, c3[:2], "callook.info without the cross-sign")
+
+    # (from here on, certificates are signed with RSA, which is
+    # deterministic, and given their serial numbers, so they take nothing
+    # from RNG and the vectors made after them stay as they were)
+
+    # addresses: a host that is an IPv4 or IPv6 address matches only a
+    # certificate's IP addresses, byte for byte, and a name only its DNS
+    # names
+    def alt(*items):
+        return der_ext("2.5.29.17", der_seq(*items))
+
+    v4, v6 = ipaddress.ip_address("192.0.2.7").packed, ipaddress.ip_address("2001:db8::1").packed
+    cert("leaf-ip", leaf_cert(k_leaf, "Test CA RSA", k_int_rsa, serial=101,
+                              san=alt(der_tlv(0x82, b"example.com"), der_tlv(0x87, v4), der_tlv(0x87, v6))))
+    for host, expect, what in [
+            ("192.0.2.7", "valid", "an IPv4 address"),
+            ("2001:db8::1", "valid", "an IPv6 address"),
+            ("2001:0DB8:0:0:0:0:0:1", "valid", "an IPv6 address spelled out"),
+            ("192.0.2.8", "invalid", "another IPv4 address"),
+            ("2001:db8::2", "invalid", "another IPv6 address"),
+            ("::ffff:192.0.2.7", "invalid", "the IPv4 address mapped into IPv6"),
+            ("example.com", "valid", "the DNS name beside the addresses")]:
+        case(expect, host, now, ["root-rsa"], ["leaf-ip", "int-rsa"], what)
+    cert("leaf-ip-as-name", leaf_cert(k_leaf, "Test CA RSA", k_int_rsa, serial=102, sans=["192.0.2.7"]))
+    case("invalid", "192.0.2.7", now, ["root-rsa"], ["leaf-ip-as-name", "int-rsa"], "an address as a DNS name")
+    cert("leaf-ip-only", leaf_cert(k_leaf, "Test CA RSA", k_int_rsa, serial=103, san=alt(der_tlv(0x87, v4))))
+    case("invalid", "example.com", now, ["root-rsa"], ["leaf-ip-only", "int-rsa"], "a name, and only an address")
+    malformed("an IP address of 5 bytes",
+              leaf_cert(k_leaf, "Test CA RSA", k_int_rsa, serial=104, san=alt(der_tlv(0x87, v4 + b"\x00"))))
+
+    # certificates built to be tried in every order, which the search must
+    # get through quickly: seven CAs with one name and key, each able to
+    # issue the others, alone and with the way out a root issued (a CA of
+    # that name allowing no CA below it, so no long path gets there
+    # first); and six levels of three CAs, each level's three alike but
+    # for the serial number and each able to issue all three below it,
+    # with nothing a root issued at the top (3 + 9 + ... + 729 signatures
+    # to try every path)
+    ring = ["ring-%d" % j for j in range(7)]
+    for j, name in enumerate(ring):
+        cert(name, ca_cert("Ring", k_int_rsa, "Ring", k_int_rsa, pathlen=None, serial=200 + j))
+    cert("ring-out", ca_cert("Ring", k_int_rsa, "Test Root RSA", k_root_rsa, serial=207))
+    cert("leaf-ring", leaf_cert(k_leaf, "Ring", k_int_rsa, serial=105))
+    case("invalid", "example.com", now, ["root-rsa"], ["leaf-ring"] + ring, "seven CAs with one name and key")
+    # (the reference, which tries a CA again under another of its name and
+    # key, spends its own limit of signature checks going round the ring
+    # and refuses this; nxtls, as Go, takes the way out)
+    case("valid", "example.com", now, ["root-rsa"], ["leaf-ring"] + ring + ["ring-out"],
+         "seven CAs with one name and key, and the way out", "lenient")
+    keys = [k_int_rsa, k_root_rsa]
+    maze = []
+    for level in range(1, 7):
+        for j in range(3):
+            maze.append("maze-%d%s" % (level, "abc"[j]))
+            cert(maze[-1], ca_cert("Maze %d" % level, keys[level % 2], "Maze %d" % (level + 1), keys[(level + 1) % 2],
+                                   pathlen=None, serial=300 + 10 * level + j))
+    cert("leaf-maze", leaf_cert(k_leaf, "Maze 1", keys[1], serial=106))
+    case("invalid", "example.com", now, ["root-rsa"], ["leaf-maze"] + maze, "a maze of CAs that ends nowhere")
 
     # the reference agrees wherever the vectors do not say otherwise
     wrong = []
@@ -1827,7 +1892,8 @@ def tls13_vectors():
            "# feed chunk-size bytes (0 for all at once); check (the chain, then accept or",
            "# reject); state waiting|check|open|closed; alert code (the one the client sent);",
            "# send data; app data (what the client received); send_pattern and app_pattern n",
-           "# (n bytes, i % 251); peer_closed; close; end"]
+           "# (n bytes, i % 251); peer_closed; eof (the server's side of TCP closed); truncated 0|1",
+           "# (whether it closed without close_notify); close; end"]
 
     def ex(name, host="tls.example", chain=ec_chain, key=k_ec):
         return TlsScript(out, name, host, now, [root], chain, key)
@@ -1843,6 +1909,10 @@ def tls13_vectors():
     t.line("app", hx(answer))
     t.feed(tls_seal(t.sr, 21, b"\x01\x00"))
     t.line("peer_closed")
+    # TCP closing after close_notify is the clean end, and the client may
+    # still send its own
+    t.line("eof")
+    t.line("truncated", 0)
     t.line("close")
     t.expect(tls_seal(t.cw, 21, b"\x01\x00"))
     t.line("state", "closed")
@@ -1864,6 +1934,10 @@ def tls13_vectors():
     t.line("app_pattern", len(big))
     t.line("send_pattern", len(big))
     t.expect(tls_seal(t.cw, 23, big[:16384]) + tls_seal(t.cw, 23, big[16384:]))
+    # TCP closing without close_notify: what came may be cut short
+    t.line("eof")
+    t.line("truncated", 1)
+    t.line("state", "closed")
     t.end()
 
     for name, host, chain, key, scheme in [("RSA-PSS", "rsa.example", rsa_chain, k_rsa, 0x0804),
@@ -2015,6 +2089,13 @@ def tls13_vectors():
     t.feed(tls_seal(t.sr, 22, hs_msg(24, b"\x02")))
     t.expect(t.alert(47))
     t.line("alert", 47)
+    t.end()
+    # TCP closing before the ServerHello: a failed handshake, not a
+    # truncation
+    t = ex("the server gone at once")
+    t.line("eof")
+    t.line("state", "closed")
+    t.line("truncated", 0)
     t.end()
     return "\n".join(out) + "\n"
 

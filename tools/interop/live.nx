@@ -1,13 +1,16 @@
 // nxtls against real servers, with the system's CA bundle: live [bundle].
-// The hosts QNI talks to must answer (exit 1 otherwise); the rest are
-// shown for interest. Needs the network, so CI does not run it.
+// The hosts QNI talks to must answer, whole, ending with close_notify
+// (read_all; exit 1 otherwise); the rest are shown for interest, read to
+// the end whichever way they end it. Needs the network, so CI does not
+// run it.
 
 import std.fs
 import nxtls.tls
 import nxtls.x509
 
-// the first line of the answer to a GET, or why there was none
-fn get(host: []u8, path: []u8, roots: *x509.Store) -> ?String {
+// the first line of the answer to a GET, or why there was none; `strict`
+// reads with read_all, refusing an answer without close_notify
+fn get(host: []u8, path: []u8, roots: *x509.Store, strict: bool) -> ?String {
     var conn = tls.connect(host, 443, roots, time.now(), 10000)
     if !conn.is_open() {
         println("      {}: {}", .{host, conn.problem})
@@ -18,13 +21,28 @@ fn get(host: []u8, path: []u8, roots: *x509.Store) -> ?String {
         println("      {}: the request could not be sent", .{host})
         return null
     }
-    let reply = conn.read_all(8 << 20) catch |e| {
-        println("      {}: reading the answer failed ({})", .{host, @errorName(e)})
-        return null
+    var reply = String.new()
+    if strict {
+        reply = conn.read_all(8 << 20) catch |e| {
+            println("      {}: reading the answer failed ({})", .{host, @errorName(e)})
+            return null
+        }
+    } else {
+        while true {
+            let got = conn.recv() catch |e| {
+                println("      {}: reading the answer failed ({})", .{host, @errorName(e)})
+                return null
+            }
+            if got.len == 0 {
+                break
+            }
+            reply.append(got)
+        }
     }
+    let end = if conn.truncated() { "ended without close_notify" } else { "closed with close_notify" }
     conn.close()
     let first = reply.find("\r\n") orelse reply.len
-    return format("{} ({} bytes)", .{reply[0..first], reply.len})
+    return format("{} ({} bytes, {})", .{reply[0..first], reply.len, end})
 }
 
 fn main() {
@@ -39,15 +57,15 @@ fn main() {
     println("{} roots from {} ({} skipped)", .{roots.certs.len, path, roots.skipped})
     var failed = 0
     for h in [["discord.com", "/api/v10/gateway"], ["gateway.discord.gg", "/"], ["cdn.discordapp.com", "/"], ["callook.info", "/W1AW/json"]] {
-        if let line = get(h[0], h[1], &roots) {
+        if let line = get(h[0], h[1], &roots, true) {
             println("PASS  {}: {}", .{h[0], line})
         } else {
             println("FAIL  {}", .{h[0]})
             failed += 1
         }
     }
-    for host in ["www.google.com", "github.com", "www.cloudflare.com", "www.echolink.org"] {
-        if let line = get(host, "/", &roots) {
+    for host in ["www.google.com", "github.com", "www.cloudflare.com", "www.echolink.org", "1.1.1.1", "8.8.8.8"] {
+        if let line = get(host, "/", &roots, false) {
             println("      {}: {}", .{host, line})
         }
     }
