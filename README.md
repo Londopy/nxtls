@@ -153,12 +153,16 @@ The order lets each piece be tested alone:
 4. ~~DER, PEM, X.509, RSA and ECDSA verification~~
 5. ~~The record layer and the TLS 1.3 handshake~~: RFC 8448's key
    schedule, recorded exchanges byte for byte, OpenSSL, live hosts
-6. ~~Secure randomness~~, from /dev/urandom (Nexium's std has no entropy
-   source yet)
+6. ~~Secure randomness~~, from /dev/urandom until Nexium 1.4.0 is out;
+   then from its `random.secure`, the operating system's generator, which
+   brings Windows
 
 Next: a review by someone who knows TLS. AES-GCM, P-256 key exchange and
-resumption wait until a server needs them; every host QNI talks to speaks
-ChaCha20-Poly1305 over X25519.
+resumption wait until a server needs them; every host QNI talks to through
+nxtls speaks ChaCha20-Poly1305 over X25519. TLS 1.2 is not planned: a
+server that speaks nothing newer, as www.echolink.org does, is left to the
+platform's TLS, which Nexium's std will offer beside nxtls (Nexium's
+decision 120).
 
 Code that touches secrets (X25519, HMAC and HKDF over traffic secrets,
 ChaCha20-Poly1305) is written constant time: fixed-length loops, no early
