@@ -64,7 +64,7 @@ cases where that differs from a permissive verifier such as OpenSSL's.
 
 ```toml
 [dependencies]
-nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.4.0" }
+nxtls = { git = "https://github.com/Londopy/nxtls", tag = "v0.5.0" }
 ```
 
 ```nexium
