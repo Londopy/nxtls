@@ -1241,7 +1241,7 @@ pub fn none() -> Conn {
 /// when it all worked; otherwise `problem` says what did not.
 pub fn connect(host: []u8, port: u16, roots: *x509.Store, now: i64, timeout_ms: i64) -> Conn {
     let seed = entropy.bytes(96) catch {
-        return failed("no randomness for TLS: nxtls reads /dev/urandom, which this system does not have")
+        return failed("no randomness for TLS: this system has no secure generator")
     }
     // in ms of time.monotonic (ns), which no timeout overflows
     let limited = timeout_ms > 0

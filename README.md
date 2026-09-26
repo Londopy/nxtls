@@ -48,7 +48,7 @@ talks to Discord through its TLS client.
 | `ecdsa` | ECDSA verification on P-256 and P-384, signatures in DER (verify only) | curve checks (G on the curve, n G at infinity), deterministic signatures from Python's cryptography, malleable s, tampering, keys off the curve, r and s out of range, strict DER |
 | `rsa` | RSA verification: PKCS #1 v1.5 (certificates) and PSS (TLS 1.3), keys of 2048 to 8192 bits (verify only) | keys of 2048, 2049, 3072 and 4096 bits made from a seed, signatures checked by Python's cryptography, PSS's emBits edge cases, salt and trailer errors, Bleichenbacher's e = 3 forgery |
 | `x509` | X.509 certificates: reading them, and checking a server's chain against trusted roots for a host name or an IP address: path building across cross-signed CAs, validity, CA constraints and path lengths, key usage and extended key usage, host names with wildcards, IPv4 and IPv6 addresses; the search bounded, so chains built to stall it end quickly | 80 chains and 14 malformed certificates, judged by Python's cryptography's own path validation (marked where nxtls is stricter or, once, more lenient); the real chains of discord.com, gateway.discord.gg and callook.info; roots that must still load (a zero serial, P-521, SHA-1) |
-| `entropy` | random bytes from the operating system (/dev/urandom, refusing a regular file planted in its place; none on Windows, where it says so) | lengths, repeats, every byte value in 64 KB |
+| `entropy` | random bytes from the operating system, by Nexium's `random.secure` (BCryptGenRandom on Windows, getrandom on Linux, arc4random on macOS and the BSDs) | lengths, repeats, every byte value in 64 KB |
 | `pem` | PEM blocks, as certificate files and CA bundles hold them | text around the blocks, CRLF, broken and unterminated blocks |
 | `f25519` | arithmetic mod 2^255 - 19, shared by `ed25519` and `x25519` | through both |
 | `bn` | big integers with Montgomery multiplication, for verification (public values only) | known products, powers and inverses; through `ecdsa` and `rsa` |
@@ -100,10 +100,12 @@ if !ed25519.verify(public_key, message, signature) { ... }
 ```
 
 `nx fetch` gets it into `nexium_modules/` and pins the commit in
-`nexium.lock`. It needs a 64-bit target: the field arithmetic uses
-128-bit integers. The TLS client needs /dev/urandom (Linux, macOS, the
-BSDs) and a CA bundle; on Windows `tls.connect` says there is no
-randomness rather than use a weaker kind.
+`nexium.lock`. It needs Nexium 1.4 or later, whose `random.secure` gives
+the TLS client its randomness on every system, and a 64-bit target: the
+field arithmetic uses 128-bit integers. The TLS client also needs a CA
+bundle: the system's on Linux and the BSDs, and on Windows and macOS a
+PEM file the program points it at, as those keep their roots in stores
+of their own.
 
 ## Tests
 
@@ -153,9 +155,8 @@ The order lets each piece be tested alone:
 4. ~~DER, PEM, X.509, RSA and ECDSA verification~~
 5. ~~The record layer and the TLS 1.3 handshake~~: RFC 8448's key
    schedule, recorded exchanges byte for byte, OpenSSL, live hosts
-6. ~~Secure randomness~~, from /dev/urandom until Nexium 1.4.0 is out;
-   then from its `random.secure`, the operating system's generator, which
-   brings Windows
+6. ~~Secure randomness~~, from Nexium 1.4's `random.secure`, the operating
+   system's generator, which brought Windows
 
 Next: a review by someone who knows TLS. AES-GCM, P-256 key exchange and
 resumption wait until a server needs them; every host QNI talks to through
