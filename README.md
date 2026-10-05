@@ -21,12 +21,11 @@ No C libraries, no `@cImport`, no `unsafe`: code a reviewer can read end to end.
 ---
 
 nxtls exists so that Nexium programs can verify signatures and speak
-HTTPS without handing their security to a C library. The first user is
-[QNI](https://github.com/Londopy/qni), a Discord helper for an amateur
-radio club, which checks every request's Ed25519 signature with it and
-talks to Discord through its TLS client;
+HTTPS without handing their security to a C library.
 [nexium-discord](https://github.com/Londopy/nexium-discord), a Discord bot
-library for Nexium, makes its connections with it too.
+library for Nexium, makes its connections with it, and a Discord app that
+answers interactions over a webhook can check every request's Ed25519
+signature with it before reading anything else.
 
 > [!WARNING]
 > **New.** The TLS client works against Discord, GitHub, Google,
@@ -167,8 +166,9 @@ The order lets each piece be tested alone:
    system's generator, which brought Windows
 
 Next: a review by someone who knows TLS. AES-GCM, P-256 key exchange and
-resumption wait until a server needs them; every host QNI talks to through
-nxtls speaks ChaCha20-Poly1305 over X25519. TLS 1.2 is not planned: a
+resumption wait until a server needs them; every host the live check
+requires (Discord's API, gateway and CDN, and callook.info) speaks
+ChaCha20-Poly1305 over X25519. TLS 1.2 is not planned: a
 server that speaks nothing newer, as www.echolink.org does, is left to the
 platform's TLS, which Nexium 1.4's `std.http` offers beside nxtls as
 `SystemTls` (Nexium's decision 120).

@@ -1,5 +1,6 @@
 // nxtls against real servers, with the system's CA bundle: live [bundle].
-// The hosts QNI talks to must answer, whole, ending with close_notify
+// The hosts a Discord app needs (Discord's API, gateway and CDN, and
+// callook.info's callsign lookup) must answer, whole, ending with close_notify
 // (read_all; exit 1 otherwise); the rest are shown for interest, read to
 // the end whichever way they end it. Needs the network, so CI does not
 // run it.

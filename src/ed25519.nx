@@ -6,7 +6,7 @@
 //         return http.text(401, "invalid request signature")
 //     }
 //
-// QNI checks Discord's interactions with it: the signed message is the
+// Discord's interactions are checked with it: the signed message is the
 // X-Signature-Timestamp header followed by the raw request body, and the
 // key is the application's public key.
 //
